@@ -1,5 +1,5 @@
 """
-HTTP API for local Gemma 4: text chat (`/chat`) and image+text (`/image`, multimodal checkpoint).
+HTTP API for local Gemma 4: text chat (`/chat`) and image+text (`/image` JSON or multipart, multimodal checkpoint).
 
 Run (recommended: project venv avoids C:\\Python311 permission errors):
   python -m venv .venv
@@ -37,15 +37,19 @@ import os
 import sys
 import threading
 import time
+import uuid
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import anyio
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +136,7 @@ _model_path: Path | None = None
 _load_error: str | None = None
 _model_kind: str | None = None  # "multimodal" | "causal" — set after successful load
 _gen_lock = threading.Lock()
+_transformers_runtime_patches_applied = False
 
 
 def _optional_max_memory_for_auto() -> dict[Any, str] | None:
@@ -148,6 +153,58 @@ def _truthy_env(key: str, default: bool) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_transformers_runtime_patches() -> None:
+    """
+    Transformers may prefer `torchcodec` for audio decoding when installed, but torchcodec can be
+    present yet unusable in minimal Docker images (missing FFmpeg shared libs / ABI mismatch).
+
+    Default: force librosa-based audio decoding unless GEMMA_USE_TORCHCODEC=1 and import works.
+    """
+    global _transformers_runtime_patches_applied
+    if _transformers_runtime_patches_applied:
+        return
+
+    try:
+        import transformers.audio_utils as audio_utils  # type: ignore
+        import transformers.utils.import_utils as import_utils  # type: ignore
+    except Exception as e:
+        log.warning("Runtime patches: could not import transformers modules: %s", e)
+        _transformers_runtime_patches_applied = True
+        return
+
+    def _disable_torchcodec_audio() -> None:
+        def _no_torchcodec() -> bool:
+            return False
+
+        try:
+            audio_utils.is_torchcodec_available = _no_torchcodec  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            import_utils.is_torchcodec_available = _no_torchcodec  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    use_tc = _truthy_env("GEMMA_USE_TORCHCODEC", False)
+    if not use_tc:
+        _disable_torchcodec_audio()
+        log.info("Runtime patches: GEMMA_USE_TORCHCODEC disabled — using librosa audio decoding path")
+        _transformers_runtime_patches_applied = True
+        return
+
+    try:
+        import torchcodec  # noqa: F401
+    except Exception as e:
+        log.warning(
+            "Runtime patches: GEMMA_USE_TORCHCODEC=1 but torchcodec import failed (%s); "
+            "falling back to librosa audio decoding",
+            e,
+        )
+        _disable_torchcodec_audio()
+
+    _transformers_runtime_patches_applied = True
 
 
 def _count_param_devices(model: Any) -> tuple[int, int, list[str]]:
@@ -172,21 +229,35 @@ def _default_images_dir() -> Path:
     return Path(raw).expanduser().resolve() if raw else (Path(__file__).resolve().parent / "images")
 
 
+def _default_upload_tmp_dir() -> Path:
+    raw = os.environ.get("GEMMA_UPLOAD_TMP_DIR", "").strip()
+    base = Path(raw).expanduser() if raw else Path("/tmp/gemma4-uploads")
+    base = base.resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def _resolve_image_under_images_dir(relative_name: str) -> Path:
     """Resolve a file path under the images directory; reject traversal."""
     if not relative_name or relative_name.strip() != relative_name:
         raise HTTPException(status_code=400, detail="Invalid image_file")
-    rel = Path(relative_name)
-    if rel.is_absolute():
-        raise HTTPException(status_code=400, detail="image_file must be a relative path under the images folder")
-    if ".." in rel.parts:
+    raw = Path(relative_name)
+    if ".." in raw.parts:
         raise HTTPException(status_code=400, detail="image_file cannot contain '..'")
     base = _default_images_dir().resolve()
-    candidate = (base / rel).resolve()
+    candidate = raw.expanduser().resolve() if raw.is_absolute() else (base / raw).resolve()
     try:
         candidate.relative_to(base)
     except ValueError:
-        raise HTTPException(status_code=400, detail="image_file must resolve under the images directory")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "image_file must resolve under the configured images directory "
+                f"(GEMMA_IMAGES_DIR / images root: {base}). "
+                "In Docker, host paths like /home/... are usually not visible inside the container; "
+                "use a path under the bind mount (often `/images/...`) or a relative name like `tiger.jpg`."
+            ),
+        )
     if not candidate.is_file():
         raise HTTPException(
             status_code=404,
@@ -195,32 +266,520 @@ def _resolve_image_under_images_dir(relative_name: str) -> Path:
     return candidate
 
 
-def _image_content_block(req: ImageRequest) -> dict[str, str]:
-    u = (req.image_url or "").strip()
-    f = (req.image_file or "").strip()
-    if bool(u) == bool(f):
+def _truthy_form_value(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s == "":
+        return None
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise HTTPException(status_code=400, detail=f"Invalid boolean form value: {raw!r}")
+
+
+def _parse_optional_int(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid integer form value: {raw!r}")
+
+
+def _parse_optional_float(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid float form value: {raw!r}")
+
+
+def _is_starlette_upload_file(obj: Any) -> bool:
+    """Starlette/FastAPI file uploads duck-type like this; avoid strict isinstance mismatches."""
+    return hasattr(obj, "read") and hasattr(obj, "filename")
+
+
+def _json_safe_validation_detail(obj: Any) -> Any:
+    """Make FastAPI validation errors JSON-serializable (avoid bytes in `input`)."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "input":
+                if isinstance(v, (bytes, bytearray, memoryview)):
+                    out[k] = f"<{type(v).__name__} len={len(v)}>"
+                elif _is_starlette_upload_file(v):
+                    out[k] = "<upload>"
+                else:
+                    out[k] = _json_safe_validation_detail(v)
+            else:
+                out[k] = _json_safe_validation_detail(v)
+        return out
+    if isinstance(obj, list):
+        return [_json_safe_validation_detail(x) for x in obj]
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return f"<{type(obj).__name__} len={len(obj)}>"
+    if _is_starlette_upload_file(obj):
+        return "<upload>"
+    return obj
+
+
+def _body_looks_like_multipart(body: bytes) -> bool:
+    # multipart bodies almost always begin with "--" + boundary (RFC 2046)
+    return bool(body) and body.lstrip().startswith(b"--")
+
+
+def _parse_json_model(model_cls: type[BaseModel], body: bytes, *, route: str) -> BaseModel:
+    """
+    Parse JSON into a pydantic model without letting validation errors include raw binary `input`
+    (which can crash FastAPI's jsonable_encoder on /video and /image).
+    """
+    if _body_looks_like_multipart(body):
         raise HTTPException(
-            status_code=400,
-            detail="Provide exactly one of: image_url (remote) or image_file (under the images folder).",
+            status_code=415,
+            detail=(
+                f"{route}: received multipart body but Content-Type was not multipart/form-data. "
+                "Send multipart with `-F ...`, or send JSON with `-H \"Content-Type: application/json\"`."
+            ),
         )
-    if u:
-        try:
-            pu = urlparse(u)
-        except Exception:
-            pu = None
-        host = (pu.hostname or "").lower() if pu else ""
-        if host in ("localhost",) or host.startswith("127.") or host in ("0.0.0.0",):
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"{route}: body is not UTF-8 JSON. If you intended to upload a file, use multipart/form-data "
+                f"(`curl -F ...`). Decode error: {e}"
+            ),
+        )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"{route}: invalid JSON: {e}")
+
+    try:
+        return model_cls.model_validate(data)
+    except ValidationError as e:
+        # Sanitize: drop `input` fields that may contain bytes/non-utf8 fragments.
+        safe: list[dict[str, Any]] = []
+        for err in e.errors():
+            e2 = dict(err)
+            e2.pop("input", None)
+            safe.append(e2)
+        raise HTTPException(status_code=422, detail=safe)
+
+
+async def _image_request_from_multipart(request: Request) -> tuple[ImageRequest, Path | None, str | None]:
+    """
+    Parse multipart/form-data for /image.
+
+    Typical curl:
+      curl -F "text=..." -F "image_file=@tiger.jpg" -F "max_new_tokens=128" ...
+
+    Provide exactly one of:
+    - image_url
+    - image_file (path string under GEMMA_IMAGES_DIR)
+    - one uploaded file part (recommended field name: image_file)
+    """
+    form = await request.form()
+
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing form field: text")
+
+    image_url = (form.get("image_url") or "").strip() or None
+
+    image_file_field = form.get("image_file")
+    image_file: str | None = None
+    chosen_upload: UploadFile | None = None
+    if _is_starlette_upload_file(image_file_field):
+        chosen_upload = image_file_field  # type: ignore[assignment]
+    elif image_file_field is None:
+        image_file = None
+    else:
+        image_file = str(image_file_field).strip() or None
+        if image_file.startswith("UploadFile("):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "image_url points to localhost. If you're running in Docker, localhost refers to the container, "
-                    "not your host machine. Use image_file (recommended) or use a host-reachable URL (e.g. "
-                    "http://host.docker.internal:PORT/... on Docker Desktop)."
+                    "Malformed multipart request: `image_file` was not parsed as a file upload. "
+                    "Use: -F \"image_file=@your.jpg\" (note the '@')."
                 ),
             )
-        return {"type": "image", "url": u}
-    path = _resolve_image_under_images_dir(f)
-    return {"type": "image", "path": str(path)}
+
+    uploads: list[Any] = []
+    for _, v in form.multi_items():
+        if _is_starlette_upload_file(v):
+            uploads.append(v)
+
+    if chosen_upload is None:
+        # Allow a single unnamed upload part (or pick explicitly when multiple parts exist).
+        if len(uploads) == 1:
+            chosen_upload = uploads[0]  # type: ignore[assignment]
+        elif len(uploads) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple file parts were uploaded; specify the image part as field name `image_file`.",
+            )
+
+    tmp_path: Path | None = None
+    uploaded_abs_path: str | None = None
+    if chosen_upload is not None:
+        if image_url or image_file:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide only one of: image_url, image_file (path string), or a single uploaded image file.",
+            )
+        up = chosen_upload
+        raw_name = (up.filename or "upload").strip() or "upload"
+        safe_name = Path(raw_name).name
+        suffix = Path(safe_name).suffix.lower()
+        allowed = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+        if suffix and suffix not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported uploaded image extension {suffix!r}. Allowed: {sorted(allowed)}",
+            )
+
+        data = await up.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded image file is empty")
+
+        uploads_dir = _default_upload_tmp_dir()
+        tmp_path = uploads_dir / f"{uuid.uuid4().hex}{suffix or '.bin'}"
+        tmp_path.write_bytes(data)
+        uploaded_abs_path = str(tmp_path.resolve())
+
+    enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
+    do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
+    include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+
+    if uploaded_abs_path is not None:
+        # Bypass GEMMA_IMAGES_DIR resolution: multipart uploads are staged under GEMMA_UPLOAD_TMP_DIR (writable).
+        req = ImageRequest(
+            image_url=None,
+            image_file=None,
+            image_upload_path=uploaded_abs_path,
+            text=text,
+            enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+            max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+            temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+            top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+            top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+            do_sample=do_sample,
+            include_raw=bool(include_raw) if include_raw is not None else False,
+        )
+        return req, tmp_path, uploaded_abs_path
+
+    if bool(image_url) == bool(image_file):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of: image_url, image_file (path under GEMMA_IMAGES_DIR), or one file upload.",
+        )
+
+    req = ImageRequest(
+        image_url=image_url,
+        image_file=image_file,
+        text=text,
+        enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+        max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+        temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+        top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+        top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+        do_sample=do_sample,
+        include_raw=bool(include_raw) if include_raw is not None else False,
+    )
+    return req, tmp_path, None
+
+
+async def _video_request_from_multipart(request: Request) -> tuple[VideoRequest, Path | None]:
+    form = await request.form()
+
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing form field: text")
+
+    video_url: str | None = None
+    chosen_upload: Any | None = None
+
+    video_url_field = form.get("video_url")
+    if _is_starlette_upload_file(video_url_field):
+        chosen_upload = video_url_field
+    elif video_url_field is None:
+        video_url = None
+    else:
+        video_url = str(video_url_field).strip() or None
+        if video_url and video_url.startswith("UploadFile("):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Malformed multipart request: `video_url` was not parsed as a file upload. "
+                    "Use: -F \"video_url=@your.mp4\" (note the '@'), or use -F \"video_file=@your.mp4\"."
+                ),
+            )
+
+    video_file_field = form.get("video_file")
+    if chosen_upload is None and _is_starlette_upload_file(video_file_field):
+        chosen_upload = video_file_field
+    elif chosen_upload is None and video_file_field is not None and not _is_starlette_upload_file(video_file_field):
+        # Allow path-like strings under rare clients; most users should upload bytes with @.
+        raise HTTPException(
+            status_code=400,
+            detail="`video_file` must be a file upload (use -F \"video_file=@movie.mp4\").",
+        )
+
+    uploads: list[Any] = []
+    for _, v in form.multi_items():
+        if _is_starlette_upload_file(v):
+            uploads.append(v)
+
+    if chosen_upload is None:
+        if len(uploads) == 1:
+            chosen_upload = uploads[0]
+        elif len(uploads) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple file parts were uploaded; specify `video_url=@...` or `video_file=@...`.",
+            )
+
+    tmp_path: Path | None = None
+    uploaded_abs_path: str | None = None
+    if chosen_upload is not None:
+        if video_url:
+            raise HTTPException(status_code=400, detail="Provide only one of: video_url (string) or a video file upload.")
+
+        up = chosen_upload
+        raw_name = (up.filename or "upload").strip() or "upload"
+        safe_name = Path(raw_name).name
+        suffix = Path(safe_name).suffix.lower()
+        allowed = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
+        if suffix and suffix not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported uploaded video extension {suffix!r}. Allowed: {sorted(allowed)}",
+            )
+
+        data = await up.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded video file is empty")
+
+        uploads_dir = _default_upload_tmp_dir()
+        tmp_path = uploads_dir / f"{uuid.uuid4().hex}{suffix or '.mp4'}"
+        tmp_path.write_bytes(data)
+        uploaded_abs_path = str(tmp_path.resolve())
+
+    enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
+    do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
+    include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+
+    if uploaded_abs_path is not None:
+        req = VideoRequest(
+            video_url=None,
+            video_upload_path=uploaded_abs_path,
+            text=text,
+            enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+            max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+            temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+            top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+            top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+            do_sample=do_sample,
+            include_raw=bool(include_raw) if include_raw is not None else False,
+        )
+        return req, tmp_path
+
+    if not video_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing video input: provide `video_url` as http(s) string, or upload a file via `video_url=@...`.",
+        )
+
+    req = VideoRequest(
+        video_url=video_url,
+        video_upload_path=None,
+        text=text,
+        enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+        max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+        temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+        top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+        top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+        do_sample=do_sample,
+        include_raw=bool(include_raw) if include_raw is not None else False,
+    )
+    return req, None
+
+
+async def _audio_request_from_multipart(request: Request) -> tuple[AudioRequest, Path | None]:
+    form = await request.form()
+
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing form field: text")
+
+    audio_url: str | None = None
+    chosen_upload: Any | None = None
+
+    audio_url_field = form.get("audio_url")
+    if _is_starlette_upload_file(audio_url_field):
+        chosen_upload = audio_url_field
+    elif audio_url_field is None:
+        audio_url = None
+    else:
+        audio_url = str(audio_url_field).strip() or None
+        if audio_url and audio_url.startswith("UploadFile("):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Malformed multipart request: `audio_url` was not parsed as a file upload. "
+                    "Use: -F \"audio_url=@your.wav\" (note the '@'), or use -F \"audio_file=@your.wav\"."
+                ),
+            )
+
+    audio_file_field = form.get("audio_file")
+    if chosen_upload is None and _is_starlette_upload_file(audio_file_field):
+        chosen_upload = audio_file_field
+    elif chosen_upload is None and audio_file_field is not None and not _is_starlette_upload_file(audio_file_field):
+        raise HTTPException(
+            status_code=400,
+            detail="`audio_file` must be a file upload (use -F \"audio_file=@clip.wav\").",
+        )
+
+    uploads: list[Any] = []
+    for _, v in form.multi_items():
+        if _is_starlette_upload_file(v):
+            uploads.append(v)
+
+    if chosen_upload is None:
+        if len(uploads) == 1:
+            chosen_upload = uploads[0]
+        elif len(uploads) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple file parts were uploaded; specify `audio_url=@...` or `audio_file=@...`.",
+            )
+
+    tmp_path: Path | None = None
+    uploaded_abs_path: str | None = None
+    if chosen_upload is not None:
+        if audio_url:
+            raise HTTPException(status_code=400, detail="Provide only one of: audio_url (string) or an audio file upload.")
+
+        up = chosen_upload
+        raw_name = (up.filename or "upload").strip() or "upload"
+        safe_name = Path(raw_name).name
+        suffix = Path(safe_name).suffix.lower()
+        allowed = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac"}
+        if suffix and suffix not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported uploaded audio extension {suffix!r}. Allowed: {sorted(allowed)}",
+            )
+
+        data = await up.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+        uploads_dir = _default_upload_tmp_dir()
+        tmp_path = uploads_dir / f"{uuid.uuid4().hex}{suffix or '.wav'}"
+        tmp_path.write_bytes(data)
+        uploaded_abs_path = str(tmp_path.resolve())
+
+    enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
+    do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
+    include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+
+    if uploaded_abs_path is not None:
+        req = AudioRequest(
+            audio_url=None,
+            audio_upload_path=uploaded_abs_path,
+            text=text,
+            enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+            max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+            temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+            top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+            top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+            do_sample=do_sample,
+            include_raw=bool(include_raw) if include_raw is not None else False,
+        )
+        return req, tmp_path
+
+    if not audio_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing audio input: provide `audio_url` as http(s) string, or upload a file via `audio_url=@...`.",
+        )
+
+    req = AudioRequest(
+        audio_url=audio_url,
+        audio_upload_path=None,
+        text=text,
+        enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+        max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
+        temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+        top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+        top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+        do_sample=do_sample,
+        include_raw=bool(include_raw) if include_raw is not None else False,
+    )
+    return req, None
+
+
+async def _chat_request_from_multipart(request: Request) -> ChatRequest:
+    form = await request.form()
+
+    # Reject accidental file parts early (multipart can include uploads; chat expects fields only).
+    for _, v in form.multi_items():
+        if _is_starlette_upload_file(v):
+            raise HTTPException(
+                status_code=400,
+                detail="Multipart /chat does not accept file uploads. Put JSON in `messages` or use field `text`.",
+            )
+
+    messages_raw = form.get("messages")
+    text = (form.get("text") or "").strip()
+
+    messages: list[ChatMessage]
+    if messages_raw is not None:
+        if text:
+            raise HTTPException(status_code=400, detail="Provide only one of: `messages` (JSON string) or `text`.")
+        if not str(messages_raw).strip():
+            raise HTTPException(status_code=400, detail="`messages` is empty")
+        try:
+            data = json.loads(str(messages_raw))
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"`messages` must be valid JSON: {e}")
+        if not isinstance(data, list) or not data:
+            raise HTTPException(status_code=400, detail="`messages` must be a non-empty JSON array")
+        try:
+            messages = [ChatMessage.model_validate(m) for m in data]
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=_json_safe_validation_detail(e.errors()))
+    else:
+        if not text:
+            raise HTTPException(status_code=400, detail="Missing form field: text (or provide `messages` as JSON)")
+        messages = [ChatMessage(role="user", content=text)]
+
+    enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
+    do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
+    include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+
+    return ChatRequest(
+        messages=messages,
+        enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
+        max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 1024,  # type: ignore[arg-type]
+        temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
+        top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
+        top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
+        do_sample=do_sample,
+        include_raw=bool(include_raw) if include_raw is not None else False,
+    )
 
 
 def _validate_remote_media_url(url: str, *, kind: str) -> None:
@@ -267,6 +826,8 @@ def _load_model() -> None:
         _load_error = f"transformers import failed: {e}"
         log.exception("transformers import failed")
         return
+
+    _apply_transformers_runtime_patches()
 
     require_gpu = _truthy_env("GEMMA_REQUIRE_GPU", True)
     if require_gpu and not torch.cuda.is_available():
@@ -472,6 +1033,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Gemma 4 local chat API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Default handler tries to json-encode pydantic errors verbatim; `input` may contain raw multipart bytes.
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe_validation_detail(exc.errors())},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("GEMMA_CORS_ORIGINS", "*").split(","),
@@ -529,7 +1101,18 @@ class ImageRequest(BaseModel):
     )
     image_file: str | None = Field(
         default=None,
-        description="Filename or subpath under the `images` folder, e.g. `photo.png` or `shots/frame.jpg`",
+        description=(
+            "Path to an image under the configured images directory (`GEMMA_IMAGES_DIR`). "
+            "May be relative (e.g. `photo.png`) or absolute as long as it resolves under that root "
+            "(in Docker this is commonly `/images/...`)."
+        ),
+    )
+    image_upload_path: str | None = Field(
+        default=None,
+        description=(
+            "Internal: absolute filesystem path to an uploaded image staged outside `GEMMA_IMAGES_DIR`. "
+            "Not intended for JSON clients."
+        ),
     )
     text: str = Field(..., description="Question or instruction about the image")
     enable_thinking: bool = False
@@ -540,9 +1123,27 @@ class ImageRequest(BaseModel):
     do_sample: bool | None = None
     include_raw: bool = False
 
+    @model_validator(mode="after")
+    def _validate_image_sources(self) -> ImageRequest:
+        u = bool((self.image_url or "").strip())
+        f = bool((self.image_file or "").strip())
+        p = bool((self.image_upload_path or "").strip())
+        if int(u) + int(f) + int(p) != 1:
+            raise ValueError(
+                "Provide exactly one of: image_url, image_file (under GEMMA_IMAGES_DIR), or image_upload_path (internal)."
+            )
+        return self
+
 
 class VideoRequest(BaseModel):
-    video_url: str = Field(..., description="HTTP(S) URL of the video (mp4/webm).")
+    video_url: str | None = Field(
+        default=None,
+        description="HTTP(S) URL of the video (mp4/webm), OR use multipart upload fields instead.",
+    )
+    video_upload_path: str | None = Field(
+        default=None,
+        description="Internal: absolute filesystem path to an uploaded video staged under GEMMA_UPLOAD_TMP_DIR.",
+    )
     text: str = Field(..., description="Question or instruction about the video")
     enable_thinking: bool = False
     max_new_tokens: int = Field(512, ge=1, le=8192)
@@ -552,9 +1153,24 @@ class VideoRequest(BaseModel):
     do_sample: bool | None = None
     include_raw: bool = False
 
+    @model_validator(mode="after")
+    def _validate_video_sources(self) -> VideoRequest:
+        u = bool((self.video_url or "").strip())
+        p = bool((self.video_upload_path or "").strip())
+        if int(u) + int(p) != 1:
+            raise ValueError("Provide exactly one of: video_url (remote) or a multipart file upload.")
+        return self
+
 
 class AudioRequest(BaseModel):
-    audio_url: str = Field(..., description="HTTP(S) URL of the audio (wav/mp3/flac).")
+    audio_url: str | None = Field(
+        default=None,
+        description="HTTP(S) URL of the audio (wav/mp3/flac), OR use multipart upload fields instead.",
+    )
+    audio_upload_path: str | None = Field(
+        default=None,
+        description="Internal: absolute filesystem path to an uploaded audio staged under GEMMA_UPLOAD_TMP_DIR.",
+    )
     text: str = Field(..., description="Question or instruction about the audio")
     enable_thinking: bool = False
     max_new_tokens: int = Field(512, ge=1, le=8192)
@@ -563,6 +1179,14 @@ class AudioRequest(BaseModel):
     top_k: int | None = Field(None, ge=1)
     do_sample: bool | None = None
     include_raw: bool = False
+
+    @model_validator(mode="after")
+    def _validate_audio_sources(self) -> AudioRequest:
+        u = bool((self.audio_url or "").strip())
+        p = bool((self.audio_upload_path or "").strip())
+        if int(u) + int(p) != 1:
+            raise ValueError("Provide exactly one of: audio_url (remote) or a multipart file upload.")
+        return self
 
 
 def _inference_device() -> Any:
@@ -647,6 +1271,45 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
     )
 
 
+def _image_content_block(req: ImageRequest) -> dict[str, str]:
+    u = (req.image_url or "").strip()
+    f = (req.image_file or "").strip()
+    p = (req.image_upload_path or "").strip()
+
+    # `ImageRequest` already enforces exactly-one via model_validator, but keep server-side checks explicit.
+    if int(bool(u)) + int(bool(f)) + int(bool(p)) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of: image_url, image_file (under GEMMA_IMAGES_DIR), or multipart upload.",
+        )
+
+    if u:
+        try:
+            pu = urlparse(u)
+        except Exception:
+            pu = None
+        host = (pu.hostname or "").lower() if pu else ""
+        if host in ("localhost",) or host.startswith("127.") or host in ("0.0.0.0",):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "image_url points to localhost. If you're running in Docker, localhost refers to the container, "
+                    "not your host machine. Use image_file (recommended) or use a host-reachable URL (e.g. "
+                    "http://host.docker.internal:PORT/... on Docker Desktop)."
+                ),
+            )
+        return {"type": "image", "url": u}
+
+    if p:
+        path = Path(p).expanduser().resolve()
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded image not found: {path}")
+        return {"type": "image", "path": str(path)}
+
+    path = _resolve_image_under_images_dir(f)
+    return {"type": "image", "path": str(path)}
+
+
 def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> ChatResponse:
     assert _model is not None and _processor is not None
 
@@ -712,16 +1375,25 @@ def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> Chat
 def _video_generate_sync(req: VideoRequest) -> ChatResponse:
     assert _model is not None and _processor is not None
 
+    upload_path = (req.video_upload_path or "").strip()
     video_url = (req.video_url or "").strip()
-    if not video_url:
-        raise HTTPException(status_code=400, detail="video_url is required")
-    _validate_remote_media_url(video_url, kind="video")
+
+    if upload_path:
+        p = Path(upload_path).expanduser().resolve()
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded video not found: {p}")
+        video_ref = str(p)
+    else:
+        if not video_url:
+            raise HTTPException(status_code=400, detail="video_url is required")
+        _validate_remote_media_url(video_url, kind="video")
+        video_ref = video_url
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "video", "video": video_url},
+                {"type": "video", "video": video_ref},
                 {"type": "text", "text": req.text},
             ],
         }
@@ -746,7 +1418,7 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to fetch/process video_url inside the server. "
+                "Failed to fetch/process video input inside the server. "
                 f"{e.__class__.__name__}: {e}"
             ),
         )
@@ -763,8 +1435,8 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
     )
 
     log.info(
-        "Video: generate url=%s max_new_tokens=%s do_sample=%s input_len=%s",
-        video_url[:120] + ("..." if len(video_url) > 120 else ""),
+        "Video: generate src=%s max_new_tokens=%s do_sample=%s input_len=%s",
+        video_ref[:120] + ("..." if len(video_ref) > 120 else ""),
         req.max_new_tokens,
         gen_kwargs["do_sample"],
         input_len,
@@ -790,16 +1462,25 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
 def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
     assert _model is not None and _processor is not None
 
+    upload_path = (req.audio_upload_path or "").strip()
     audio_url = (req.audio_url or "").strip()
-    if not audio_url:
-        raise HTTPException(status_code=400, detail="audio_url is required")
-    _validate_remote_media_url(audio_url, kind="audio")
+
+    if upload_path:
+        p = Path(upload_path).expanduser().resolve()
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded audio not found: {p}")
+        audio_ref = str(p)
+    else:
+        if not audio_url:
+            raise HTTPException(status_code=400, detail="audio_url is required")
+        _validate_remote_media_url(audio_url, kind="audio")
+        audio_ref = audio_url
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "audio", "audio": audio_url},
+                {"type": "audio", "audio": audio_ref},
                 {"type": "text", "text": req.text},
             ],
         }
@@ -824,7 +1505,7 @@ def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to fetch/process audio_url inside the server. "
+                "Failed to fetch/process audio input inside the server. "
                 f"{e.__class__.__name__}: {e}"
             ),
         )
@@ -841,8 +1522,8 @@ def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
     )
 
     log.info(
-        "Audio: generate url=%s max_new_tokens=%s do_sample=%s input_len=%s",
-        audio_url[:120] + ("..." if len(audio_url) > 120 else ""),
+        "Audio: generate src=%s max_new_tokens=%s do_sample=%s input_len=%s",
+        audio_ref[:120] + ("..." if len(audio_ref) > 120 else ""),
         req.max_new_tokens,
         gen_kwargs["do_sample"],
         input_len,
@@ -902,15 +1583,32 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, _: None = Depends(require_api_key)):
+async def chat(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
     if _model is None or _processor is None:
         raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+
+    ct = (request.headers.get("content-type") or "").lower()
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req = await _chat_request_from_multipart(request)
+    else:
+        req = _parse_json_model(ChatRequest, body, route="POST /chat")  # type: ignore[assignment]
 
     return await anyio.to_thread.run_sync(lambda: _generate_sync(req))
 
 
 @app.post("/image", response_model=ChatResponse)
-async def image_chat(req: ImageRequest, _: None = Depends(require_api_key)):
+async def image_chat(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
     if _model is None or _processor is None:
         raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
     if _model_kind != "multimodal":
@@ -922,12 +1620,37 @@ async def image_chat(req: ImageRequest, _: None = Depends(require_api_key)):
             ),
         )
 
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path, _ = await _image_request_from_multipart(request)
+    else:
+        # IMPORTANT: do not declare `ImageRequest` as a FastAPI parameter here.
+        # For multipart uploads, FastAPI may try to treat file bytes as JSON and crash while encoding errors.
+        req = _parse_json_model(ImageRequest, body, route="POST /image")  # type: ignore[assignment]
+
+    assert req is not None
     image_block = _image_content_block(req)
-    return await anyio.to_thread.run_sync(lambda: _image_generate_sync(req, image_block))
+    try:
+        return await anyio.to_thread.run_sync(lambda: _image_generate_sync(req, image_block))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Image: could not delete temp upload: %s", tmp_path)
 
 
 @app.post("/video", response_model=ChatResponse)
-async def video_chat(req: VideoRequest, _: None = Depends(require_api_key)):
+async def video_chat(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
     if _model is None or _processor is None:
         raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
     if _model_kind != "multimodal":
@@ -939,11 +1662,33 @@ async def video_chat(req: VideoRequest, _: None = Depends(require_api_key)):
             ),
         )
 
-    return await anyio.to_thread.run_sync(lambda: _video_generate_sync(req))
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path = await _video_request_from_multipart(request)
+    else:
+        req = _parse_json_model(VideoRequest, body, route="POST /video")  # type: ignore[assignment]
+
+    try:
+        return await anyio.to_thread.run_sync(lambda: _video_generate_sync(req))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Video: could not delete temp upload: %s", tmp_path)
 
 
 @app.post("/audio", response_model=ChatResponse)
-async def audio_chat(req: AudioRequest, _: None = Depends(require_api_key)):
+async def audio_chat(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
     if _model is None or _processor is None:
         raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
     if _model_kind != "multimodal":
@@ -955,7 +1700,26 @@ async def audio_chat(req: AudioRequest, _: None = Depends(require_api_key)):
             ),
         )
 
-    return await anyio.to_thread.run_sync(lambda: _audio_generate_sync(req))
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path = await _audio_request_from_multipart(request)
+    else:
+        req = _parse_json_model(AudioRequest, body, route="POST /audio")  # type: ignore[assignment]
+
+    try:
+        return await anyio.to_thread.run_sync(lambda: _audio_generate_sync(req))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Audio: could not delete temp upload: %s", tmp_path)
 
 
 @app.get("/")
@@ -963,10 +1727,10 @@ def root():
     return {
         "service": "gemma-4-local-chat",
         "endpoints": {
-            "POST /chat": "text chat",
-            "POST /image": "image (image_url or image_file under ./images) + text — multimodal model only",
-            "POST /video": "video (video_url) + text — multimodal model only",
-            "POST /audio": "audio (audio_url) + text — multimodal model only",
+            "POST /chat": "text chat (JSON or multipart/form-data: text=... OR messages=<json>)",
+            "POST /image": "image (JSON or multipart/form-data: image_url | image_file | upload) + text — multimodal only",
+            "POST /video": "video (JSON video_url OR multipart upload: video_url=@file / video_file=@file) + text — multimodal only",
+            "POST /audio": "audio (JSON audio_url OR multipart upload: audio_url=@file / audio_file=@file) + text — multimodal only",
             "GET /health": "load status",
         },
         "model_path_env": "GEMMA_MODEL_PATH (default: ./gemma-4-E4B-it next to api_server.py)",

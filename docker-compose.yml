@@ -25,6 +25,8 @@ services:
       GEMMA_LOAD_HEARTBEAT_SEC: "${GEMMA_LOAD_HEARTBEAT_SEC:-10}"
       GEMMA_MODEL_PATH: "${GEMMA_MODEL_PATH:-/model}"
       GEMMA_IMAGES_DIR: "${GEMMA_IMAGES_DIR:-/images}"
+      GEMMA_UPLOAD_TMP_DIR: "${GEMMA_UPLOAD_TMP_DIR:-}"
+      GEMMA_USE_TORCHCODEC: "${GEMMA_USE_TORCHCODEC:-0}"
       GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
       # If full fp/bf16 model OOMs on your GPU, comment cuda0 and use auto + 4-bit instead:
       # GEMMA_DEVICE_MAP: "auto"

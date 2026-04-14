@@ -4,7 +4,7 @@ Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load 
 
 ### Endpoints
 
-- **`POST /chat`**: text → text
+- **`POST /chat`**: text → text (JSON or `multipart/form-data`)
 - **`POST /image`**: image + text → text (multimodal checkpoint required)
 - **`POST /video`**: video + text → text (multimodal checkpoint required)
 - **`POST /audio`**: audio + text → text (multimodal checkpoint required)
@@ -73,12 +73,37 @@ curl -sS -X POST "http://99.64.152.85:5000/chat" \
   --data-binary "@test/chat_test.json"
 ```
 
+**Multipart (`multipart/form-data`) — simple one-shot message**
+
+```bash
+curl -sS -X POST "http://99.64.152.85:5000/chat" \
+  -F "text=Reply with exactly three words." \
+  -F "max_new_tokens=64"
+```
+
+**Multipart — full `messages` JSON (string field)**
+
+```bash
+curl -sS -X POST "http://99.64.152.85:5000/chat" \
+  -F 'messages=[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Reply with exactly three words."}]' \
+  -F "max_new_tokens=64"
+```
+
 ### `POST /image`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/image" \
   -H "Content-Type: application/json" \
   --data-binary "@test/image_test.json"
+```
+
+**Multipart upload (`multipart/form-data`)**
+
+```bash
+curl -sS -X POST "http://99.64.152.85:5000/image" \
+  -F "text=Describe this." \
+  -F "image_file=@eiffel_tower.jpg" \
+  -F "max_new_tokens=128"
 ```
 
 ### `POST /video`
@@ -89,6 +114,21 @@ curl -sS -X POST "http://99.64.152.85:5000/video" \
   --data-binary "@test/video_test.json"
 ```
 
+**Multipart upload (`multipart/form-data`)**
+
+```bash
+curl -sS -X POST "http://99.64.152.85:5000/video" \
+  -F "text=Describe this video." \
+  -F "video_url=@ForBiggerBlazes.mp4" \
+  -F "max_new_tokens=256"
+```
+
+Notes:
+- `curl -F` requires `@` to upload file bytes.
+- Your URL must be quoted correctly: `".../video"` (closing quote before `-F`).
+
+Video decoding: Transformers may warn that `torchvision` video decoding is deprecated. **Audio** decoding in Transformers may try `torchcodec` if installed; this repo defaults to **`GEMMA_USE_TORCHCODEC=0`** to force the **librosa** audio path (more reliable in Docker).
+
 ### `POST /audio`
 
 ```bash
@@ -97,11 +137,26 @@ curl -sS -X POST "http://99.64.152.85:5000/audio" \
   --data-binary "@test/audio_test.json"
 ```
 
+**Multipart upload (`multipart/form-data`)**
+
+```bash
+curl -sS -X POST "http://99.64.152.85:5000/audio" \
+  -F "text=Transcribe the following speech segment in its original language. Only output the transcription, with no newlines." \
+  -F "audio_url=@Demos_sample-data_journal1.wav" \
+  -F "max_new_tokens=256"
+```
+
+Uploaded audio is staged under **`GEMMA_UPLOAD_TMP_DIR`** (default: `/tmp/gemma4-uploads`) and deleted after the request.
+
 ## Common issues
 
 ### `/image` / `/video` / `/audio` returns 503 about multimodal
 
 Your checkpoint must load as a multimodal model. `/health` shows `"model_kind": "multimodal"` when this is OK.
+
+### Multipart `/image` fails: `python-multipart` must be installed
+
+FastAPI/Starlette requires **`python-multipart`** to parse `multipart/form-data` (used by `curl -F ...`).
 
 ### Remote URLs fail inside Docker
 
