@@ -78,7 +78,7 @@ curl -sS -X POST "http://99.64.152.85:5000/chat" \
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/image" \
   -H "Content-Type: application/json" \
-  --data-binary "@image_url_test.json"
+  --data-binary "@test/image_test.json"
 ```
 
 ### `POST /video`
