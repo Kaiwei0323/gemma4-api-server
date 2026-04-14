@@ -1,0 +1,14 @@
+# Local secrets (never commit)
+.env
+
+# Large local model checkpoint (bind-mount only)
+gemma-4-E4B-it/
+
+# Python / tooling noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/

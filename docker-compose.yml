@@ -1,0 +1,36 @@
+# GPU: install NVIDIA Container Toolkit on Linux, or enable GPU in Docker Desktop (WSL2).
+# Build:  docker compose build
+# Run:    docker compose up
+# Model: bind-mount ./gemma-4-E4B-it to /model (full checkpoint with weights).
+
+services:
+  gemma-api:
+    build: .
+    image: gemma4-api:local
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-5000}:${CONTAINER_PORT:-5000}"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: "${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
+      # All weights on GPU 0 inside the container (see api_server / HF device_map).
+      GEMMA_REQUIRE_GPU: "${GEMMA_REQUIRE_GPU:-1}"
+      GEMMA_DEVICE_MAP: "${GEMMA_DEVICE_MAP:-cuda0}"
+      GEMMA_MAX_MEMORY_GPU: "${GEMMA_MAX_MEMORY_GPU:-}"
+      GEMMA_MAX_MEMORY_CPU: "${GEMMA_MAX_MEMORY_CPU:-}"
+      GEMMA_LOAD_4BIT: "${GEMMA_LOAD_4BIT:-0}"
+      GEMMA_LOAD_8BIT: "${GEMMA_LOAD_8BIT:-0}"
+      GEMMA_LOG_CONFIGURE: "${GEMMA_LOG_CONFIGURE:-1}"
+      GEMMA_WEIGHTS_TQDM: "${GEMMA_WEIGHTS_TQDM:-1}"
+      GEMMA_LOAD_HEARTBEAT: "${GEMMA_LOAD_HEARTBEAT:-1}"
+      GEMMA_LOAD_HEARTBEAT_SEC: "${GEMMA_LOAD_HEARTBEAT_SEC:-10}"
+      GEMMA_MODEL_PATH: "${GEMMA_MODEL_PATH:-/model}"
+      GEMMA_IMAGES_DIR: "${GEMMA_IMAGES_DIR:-/images}"
+      GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
+      # If full fp/bf16 model OOMs on your GPU, comment cuda0 and use auto + 4-bit instead:
+      # GEMMA_DEVICE_MAP: "auto"
+      # GEMMA_LOAD_4BIT: "1"
+    volumes:
+      - ${HOST_MODEL_DIR:-./gemma-4-E4B-it}:${GEMMA_MODEL_PATH:-/model}:ro
+      - ${HOST_IMAGES_DIR:-./images}:${GEMMA_IMAGES_DIR:-/images}:ro
+    shm_size: "4gb"
+    gpus: all

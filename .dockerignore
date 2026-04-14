@@ -1,0 +1,11 @@
+.venv
+.git
+**/__pycache__
+*.pyc
+.pytest_cache
+mini-paligemma2
+.cursor
+terminals
+*.md
+.env
+.env.*

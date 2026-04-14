@@ -1,0 +1,9 @@
+# Used inside CUDA PyTorch images (torch + torchvision already installed in the base image).
+transformers>=4.49.0
+accelerate
+pillow
+librosa
+av
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0
