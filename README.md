@@ -20,12 +20,6 @@ Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load 
 
 Copy the template and edit values as needed.
 
-### Windows CMD
-
-```cmd
-copy .env.example .env
-```
-
 ### Linux/macOS
 
 ```bash
