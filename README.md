@@ -81,23 +81,13 @@ curl -sS -X POST "http://99.64.152.85:5000/chat" \
 
 ### `POST /image`
 
-**Option A (recommended): local file under `./images`**
-
-```bash
-curl -sS -X POST "http://99.64.152.85:5000/image" \
-  -H "Content-Type: application/json" \
-  --data-binary "@test/image_test.json"
-```
-
-**Option B: remote URL**
-
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/image" \
   -H "Content-Type: application/json" \
   --data-binary "@image_url_test.json"
 ```
 
-### `POST /video` (remote URL)
+### `POST /video`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/video" \
@@ -105,7 +95,7 @@ curl -sS -X POST "http://99.64.152.85:5000/video" \
   --data-binary "@test/video_test.json"
 ```
 
-### `POST /audio` (remote URL)
+### `POST /audio`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/audio" \
