@@ -15,7 +15,7 @@ The **gemma-4-31B-it** checkpoint does not support audio (`POST /audio`).
 ## Prerequisites
 
 - **Docker + GPU (Linux)**: install **NVIDIA Container Toolkit** so the container can use the GPU.
-- **Local model folder**: full checkpoint directory, e.g. `./gemma-4-E4B-it/` (must include `config.json` and weight shards). This is bind-mounted to `/model`.
+- **Local model folder**: full checkpoint directory, e.g. `./gemma-4-31B-it/` (must include `config.json` and weight shards). This is bind-mounted to `/model`.
 
 ## Configuration (`.env`)
 
