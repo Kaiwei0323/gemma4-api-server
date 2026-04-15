@@ -20,7 +20,7 @@ GPU (default: require CUDA and at least some weights on GPU):
   GEMMA_REQUIRE_GPU=0   — allow CPU-only PyTorch (not recommended for Gemma 4)
   GEMMA_DEVICE_MAP=auto (default) — Hugging Face places layers on GPU first, may offload to CPU if VRAM is tight
   GEMMA_DEVICE_MAP=cuda0 — pin entire model to GPU 0 (faster if it fits; may OOM on 12GB)
-  GEMMA_MAX_MEMORY_GPU=10GiB — with device_map=auto, cap VRAM used for weights on GPU 0 (raise toward free VRAM to reduce CPU offload; leave ~1–2GiB headroom on 12GB cards)
+  GEMMA_MAX_MEMORY_GPU=10GiB — with device_map=auto, cap per-GPU VRAM for each visible CUDA device (raise toward free VRAM to reduce CPU offload; leave ~1–2GiB headroom per GPU)
   GEMMA_MAX_MEMORY_CPU=48GiB — optional cap for CPU weight offload (default 245GiB if unset)
   GEMMA_LOAD_4BIT=1 — quantize weights to ~4 bits so the full model is more likely to fit in VRAM (requires: pip install bitsandbytes)
   GEMMA_LOAD_8BIT=1 — 8-bit quantization (smaller VRAM savings than 4-bit; do not set both 4 and 8)
@@ -28,6 +28,10 @@ GPU (default: require CUDA and at least some weights on GPU):
   GEMMA_WEIGHTS_TQDM=1 — (default) pass a tqdm class so weight-load progress prints as STARTUP weights_progress lines
   GEMMA_LOAD_HEARTBEAT=1 — (default) print STARTUP model_weights_heartbeat every GEMMA_LOAD_HEARTBEAT_SEC s during from_pretrained
   GEMMA_LOAD_HEARTBEAT_SEC=10 — heartbeat interval (seconds)
+  Multimodal preprocessing (faster / lower quality — optional):
+  GEMMA_VIDEO_NUM_FRAMES=16 — sample fewer frames from each video (default from processor, often 32; lower = faster decode + vision)
+  GEMMA_VIDEO_MAX_SOFT_TOKENS=70 — vision tokens per video frame (must be one of 70,140,280,560,1120; lower = faster, rougher)
+  GEMMA_IMAGE_MAX_SOFT_TOKENS=280 — same allowed set; lower = faster image understanding, less detail
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -135,17 +139,32 @@ _processor = None
 _model_path: Path | None = None
 _load_error: str | None = None
 _model_kind: str | None = None  # "multimodal" | "causal" — set after successful load
+_model_supports_audio: bool | None = None  # True if config.audio_config is set (audio tower weights)
 _gen_lock = threading.Lock()
 _transformers_runtime_patches_applied = False
 
 
 def _optional_max_memory_for_auto() -> dict[Any, str] | None:
-    """Accelerate `max_memory` to bias more layers onto GPU 0 (only used with device_map=auto)."""
+    """Build Accelerate `max_memory` for device_map=auto (only used when GEMMA_MAX_MEMORY_GPU is set).
+
+    The same per-GPU cap is applied to every visible CUDA device so multi-GPU splits (e.g. 31B on 2×48GB)
+    stay balanced; previously only device 0 was capped.
+    """
     gpu = os.environ.get("GEMMA_MAX_MEMORY_GPU", "").strip()
     if not gpu:
         return None
     cpu = os.environ.get("GEMMA_MAX_MEMORY_CPU", "").strip() or "245GiB"
-    return {0: gpu, "cpu": cpu}
+    try:
+        import torch
+
+        n = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        n = 0
+    if n <= 0:
+        return {0: gpu, "cpu": cpu}
+    mm: dict[Any, str] = {i: gpu for i in range(n)}
+    mm["cpu"] = cpu
+    return mm
 
 
 def _truthy_env(key: str, default: bool) -> bool:
@@ -461,6 +480,7 @@ async def _image_request_from_multipart(request: Request) -> tuple[ImageRequest,
     enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
     do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
     include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+    image_max_soft_tokens = _parse_optional_int(form.get("image_max_soft_tokens"))  # type: ignore[arg-type]
 
     if uploaded_abs_path is not None:
         # Bypass GEMMA_IMAGES_DIR resolution: multipart uploads are staged under GEMMA_UPLOAD_TMP_DIR (writable).
@@ -476,6 +496,7 @@ async def _image_request_from_multipart(request: Request) -> tuple[ImageRequest,
             top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
             do_sample=do_sample,
             include_raw=bool(include_raw) if include_raw is not None else False,
+            image_max_soft_tokens=image_max_soft_tokens,
         )
         return req, tmp_path, uploaded_abs_path
 
@@ -496,6 +517,7 @@ async def _image_request_from_multipart(request: Request) -> tuple[ImageRequest,
         top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
         do_sample=do_sample,
         include_raw=bool(include_raw) if include_raw is not None else False,
+        image_max_soft_tokens=image_max_soft_tokens,
     )
     return req, tmp_path, None
 
@@ -579,6 +601,8 @@ async def _video_request_from_multipart(request: Request) -> tuple[VideoRequest,
     enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
     do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
     include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
+    video_num_frames = _parse_optional_int(form.get("video_num_frames"))  # type: ignore[arg-type]
+    video_max_soft_tokens = _parse_optional_int(form.get("video_max_soft_tokens"))  # type: ignore[arg-type]
 
     if uploaded_abs_path is not None:
         req = VideoRequest(
@@ -592,6 +616,8 @@ async def _video_request_from_multipart(request: Request) -> tuple[VideoRequest,
             top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
             do_sample=do_sample,
             include_raw=bool(include_raw) if include_raw is not None else False,
+            video_num_frames=video_num_frames,
+            video_max_soft_tokens=video_max_soft_tokens,
         )
         return req, tmp_path
 
@@ -612,6 +638,8 @@ async def _video_request_from_multipart(request: Request) -> tuple[VideoRequest,
         top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
         do_sample=do_sample,
         include_raw=bool(include_raw) if include_raw is not None else False,
+        video_num_frames=video_num_frames,
+        video_max_soft_tokens=video_max_soft_tokens,
     )
     return req, None
 
@@ -802,8 +830,9 @@ def _validate_remote_media_url(url: str, *, kind: str) -> None:
 
 
 def _load_model() -> None:
-    global _model, _processor, _model_path, _load_error, _model_kind
+    global _model, _processor, _model_path, _load_error, _model_kind, _model_supports_audio
     _model_kind = None
+    _model_supports_audio = None
     t0 = time.perf_counter()
     raw = os.environ.get("GEMMA_MODEL_PATH", "").strip()
     path = Path(raw) if raw else _default_model_dir()
@@ -911,7 +940,10 @@ def _load_model() -> None:
         mm = _optional_max_memory_for_auto()
         if mm is not None:
             load_kw["max_memory"] = mm
-            log.info("Model load: max_memory=%r (larger GEMMA_MAX_MEMORY_GPU => fewer layers on CPU if they fit)", mm)
+            log.info(
+                "Model load: max_memory=%r (larger GEMMA_MAX_MEMORY_GPU per GPU => fewer layers on CPU if they fit)",
+                mm,
+            )
 
     attn = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "").strip()
     if attn:
@@ -1000,8 +1032,15 @@ def _load_model() -> None:
     _model = model
     _model_path = path
     _load_error = None
+    _model_supports_audio = getattr(_model.config, "audio_config", None) is not None
+    log.info(
+        "Model load: audio_config %s — POST /audio %s",
+        "present" if _model_supports_audio else "absent (null)",
+        "available" if _model_supports_audio else "disabled for this checkpoint",
+    )
     _startup_echo(
-        f"stage=model_load_complete total_s={time.perf_counter() - t0:.1f} model_kind={_model_kind!r} — HTTP API ready"
+        f"stage=model_load_complete total_s={time.perf_counter() - t0:.1f} model_kind={_model_kind!r} "
+        f"audio={_model_supports_audio!r} — HTTP API ready"
     )
     log.info(
         "Model load: complete in %.1fs — ready for /chat (%s)",
@@ -1081,6 +1120,13 @@ class ChatResponse(BaseModel):
     parsed: Any
     raw: str | None = None
     model_path: str | None = None
+    time_to_first_token_seconds: float | None = Field(
+        default=None,
+        description=(
+            "Wall seconds from the start of model.generate() until the first decoding step that produces "
+            "the first new output token (TTFT). Excludes request parsing and input preprocessing before generate()."
+        ),
+    )
     tokens_per_second: float | None = Field(
         default=None,
         description="New tokens per second during model.generate() only (output length − prompt length, wall clock).",
@@ -1092,6 +1138,109 @@ def _new_token_count_and_tps(outputs: Any, input_len: int, elapsed_s: float) -> 
     if elapsed_s <= 1e-9:
         return n_new, None
     return n_new, round(n_new / elapsed_s, 3)
+
+
+def _generate_with_ttft(inputs: Any, gen_kwargs: dict[str, Any]) -> tuple[Any, float | None, float]:
+    """Run `_model.generate` under `_gen_lock` and measure TTFT + total generate wall time.
+
+    TTFT is the wall time from immediately before `generate()` until the first `LogitsProcessor` call,
+    which aligns with the first step that produces logits for the first new token.
+    """
+    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+
+    class _TtftLogitsProcessor(LogitsProcessor):
+        def __init__(self, t_start: float) -> None:
+            self._t0 = t_start
+            self.seconds: float | None = None
+
+        def __call__(self, input_ids: Any, scores: Any) -> Any:
+            if self.seconds is None:
+                self.seconds = time.perf_counter() - self._t0
+            return scores
+
+    t_gen0 = time.perf_counter()
+    hook = _TtftLogitsProcessor(t_gen0)
+    merged = dict(gen_kwargs)
+    existing_lp = merged.get("logits_processor")
+    if existing_lp is None:
+        merged["logits_processor"] = LogitsProcessorList([hook])
+    elif isinstance(existing_lp, LogitsProcessorList):
+        merged["logits_processor"] = LogitsProcessorList(list(existing_lp) + [hook])
+    else:
+        merged["logits_processor"] = LogitsProcessorList([existing_lp, hook])
+
+    assert _model is not None
+    with _gen_lock:
+        outputs = _model.generate(**inputs, **merged)
+    gen_elapsed = time.perf_counter() - t_gen0
+    ttft = round(hook.seconds, 4) if hook.seconds is not None else None
+    return outputs, ttft, gen_elapsed
+
+
+# Gemma 4 image/video processors only allow these soft-token budgets (see transformers Gemma4*Processor).
+_GEMMA4_VISION_SOFT_TOKEN_CHOICES: frozenset[int] = frozenset({70, 140, 280, 560, 1120})
+
+
+def _optional_int_env(name: str, *, min_v: int, max_v: int) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        log.warning("Invalid integer for %s=%r — ignoring", name, raw)
+        return None
+    if v < min_v or v > max_v:
+        log.warning("%s=%s out of range [%s,%s] — ignoring", name, v, min_v, max_v)
+        return None
+    return v
+
+
+def _processor_kwargs_for_image(req: "ImageRequest") -> dict[str, Any]:
+    """Extra kwargs for `apply_chat_template(..., processor_kwargs=...)`."""
+    images_kw: dict[str, Any] = {}
+    if req.image_max_soft_tokens is not None:
+        images_kw["max_soft_tokens"] = req.image_max_soft_tokens
+    else:
+        env_v = _optional_int_env("GEMMA_IMAGE_MAX_SOFT_TOKENS", min_v=70, max_v=1120)
+        if env_v is not None and env_v in _GEMMA4_VISION_SOFT_TOKEN_CHOICES:
+            images_kw["max_soft_tokens"] = env_v
+        elif env_v is not None:
+            log.warning(
+                "GEMMA_IMAGE_MAX_SOFT_TOKENS=%s is not in %s — ignoring",
+                env_v,
+                sorted(_GEMMA4_VISION_SOFT_TOKEN_CHOICES),
+            )
+    if not images_kw:
+        return {}
+    return {"images_kwargs": images_kw}
+
+
+def _processor_kwargs_for_video(req: "VideoRequest") -> dict[str, Any]:
+    videos_kw: dict[str, Any] = {}
+    if req.video_num_frames is not None:
+        videos_kw["num_frames"] = req.video_num_frames
+    else:
+        env_nf = _optional_int_env("GEMMA_VIDEO_NUM_FRAMES", min_v=1, max_v=256)
+        if env_nf is not None:
+            videos_kw["num_frames"] = env_nf
+
+    if req.video_max_soft_tokens is not None:
+        videos_kw["max_soft_tokens"] = req.video_max_soft_tokens
+    else:
+        env_v = _optional_int_env("GEMMA_VIDEO_MAX_SOFT_TOKENS", min_v=70, max_v=1120)
+        if env_v is not None and env_v in _GEMMA4_VISION_SOFT_TOKEN_CHOICES:
+            videos_kw["max_soft_tokens"] = env_v
+        elif env_v is not None:
+            log.warning(
+                "GEMMA_VIDEO_MAX_SOFT_TOKENS=%s is not in %s — ignoring",
+                env_v,
+                sorted(_GEMMA4_VISION_SOFT_TOKEN_CHOICES),
+            )
+
+    if not videos_kw:
+        return {}
+    return {"videos_kwargs": videos_kw}
 
 
 class ImageRequest(BaseModel):
@@ -1122,6 +1271,20 @@ class ImageRequest(BaseModel):
     top_k: int | None = Field(None, ge=1)
     do_sample: bool | None = None
     include_raw: bool = False
+    image_max_soft_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Optional vision token budget per image: one of 70, 140, 280, 560, 1120. "
+            "Lower is faster with less spatial detail. Overrides GEMMA_IMAGE_MAX_SOFT_TOKENS."
+        ),
+    )
+
+    @field_validator("image_max_soft_tokens")
+    @classmethod
+    def _validate_image_soft_tokens(cls, v: int | None) -> int | None:
+        if v is None or v in _GEMMA4_VISION_SOFT_TOKEN_CHOICES:
+            return v
+        raise ValueError(f"image_max_soft_tokens must be one of {sorted(_GEMMA4_VISION_SOFT_TOKEN_CHOICES)}")
 
     @model_validator(mode="after")
     def _validate_image_sources(self) -> ImageRequest:
@@ -1152,6 +1315,29 @@ class VideoRequest(BaseModel):
     top_k: int | None = Field(None, ge=1)
     do_sample: bool | None = None
     include_raw: bool = False
+    video_num_frames: int | None = Field(
+        default=None,
+        ge=1,
+        le=256,
+        description=(
+            "Optional: number of frames sampled from the video. Lower is faster (less decode + vision work). "
+            "Overrides GEMMA_VIDEO_NUM_FRAMES."
+        ),
+    )
+    video_max_soft_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Optional vision token budget per frame: one of 70, 140, 280, 560, 1120. "
+            "Lower is faster. Overrides GEMMA_VIDEO_MAX_SOFT_TOKENS."
+        ),
+    )
+
+    @field_validator("video_max_soft_tokens")
+    @classmethod
+    def _validate_video_soft_tokens(cls, v: int | None) -> int | None:
+        if v is None or v in _GEMMA4_VISION_SOFT_TOKEN_CHOICES:
+            return v
+        raise ValueError(f"video_max_soft_tokens must be one of {sorted(_GEMMA4_VISION_SOFT_TOKEN_CHOICES)}")
 
     @model_validator(mode="after")
     def _validate_video_sources(self) -> VideoRequest:
@@ -1253,12 +1439,14 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
         gen_kwargs["do_sample"],
         input_len,
     )
-    t_gen0 = time.perf_counter()
-    with _gen_lock:
-        outputs = _model.generate(**inputs, **gen_kwargs)
-    gen_elapsed = time.perf_counter() - t_gen0
+    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
     _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info("Chat: generate wall=%.3fs tokens_per_second=%s", gen_elapsed, tps)
+    log.info(
+        "Chat: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
+        gen_elapsed,
+        ttft,
+        tps,
+    )
 
     response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
     parsed = _processor.parse_response(response)
@@ -1267,6 +1455,7 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
         parsed=parsed,
         raw=response if req.include_raw else None,
         model_path=str(_model_path) if _model_path else None,
+        time_to_first_token_seconds=ttft,
         tokens_per_second=tps,
     )
 
@@ -1328,12 +1517,21 @@ def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> Chat
         "return_tensors": "pt",
         "add_generation_prompt": True,
     }
+    mm_pk = _processor_kwargs_for_image(req)
     try:
-        inputs = _processor.apply_chat_template(
-            messages, **tpl_kw, enable_thinking=req.enable_thinking
-        )
+        if mm_pk:
+            inputs = _processor.apply_chat_template(
+                messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
+            )
+        else:
+            inputs = _processor.apply_chat_template(
+                messages, **tpl_kw, enable_thinking=req.enable_thinking
+            )
     except TypeError:
-        inputs = _processor.apply_chat_template(messages, **tpl_kw)
+        if mm_pk:
+            inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
+        else:
+            inputs = _processor.apply_chat_template(messages, **tpl_kw)
 
     inputs = inputs.to(_inference_device())
     input_len = inputs["input_ids"].shape[-1]
@@ -1354,12 +1552,14 @@ def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> Chat
         gen_kwargs["do_sample"],
         input_len,
     )
-    t_gen0 = time.perf_counter()
-    with _gen_lock:
-        outputs = _model.generate(**inputs, **gen_kwargs)
-    gen_elapsed = time.perf_counter() - t_gen0
+    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
     _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info("Image: generate wall=%.3fs tokens_per_second=%s", gen_elapsed, tps)
+    log.info(
+        "Image: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
+        gen_elapsed,
+        ttft,
+        tps,
+    )
 
     response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
     parsed = _processor.parse_response(response)
@@ -1368,6 +1568,7 @@ def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> Chat
         parsed=parsed,
         raw=response if req.include_raw else None,
         model_path=str(_model_path) if _model_path else None,
+        time_to_first_token_seconds=ttft,
         tokens_per_second=tps,
     )
 
@@ -1404,13 +1605,22 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
         "return_tensors": "pt",
         "add_generation_prompt": True,
     }
+    mm_pk = _processor_kwargs_for_video(req)
     try:
         try:
-            inputs = _processor.apply_chat_template(
-                messages, **tpl_kw, enable_thinking=req.enable_thinking
-            )
+            if mm_pk:
+                inputs = _processor.apply_chat_template(
+                    messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
+                )
+            else:
+                inputs = _processor.apply_chat_template(
+                    messages, **tpl_kw, enable_thinking=req.enable_thinking
+                )
         except TypeError:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw)
+            if mm_pk:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
+            else:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw)
     except HTTPException:
         raise
     except Exception as e:
@@ -1441,12 +1651,14 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
         gen_kwargs["do_sample"],
         input_len,
     )
-    t_gen0 = time.perf_counter()
-    with _gen_lock:
-        outputs = _model.generate(**inputs, **gen_kwargs)
-    gen_elapsed = time.perf_counter() - t_gen0
+    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
     _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info("Video: generate wall=%.3fs tokens_per_second=%s", gen_elapsed, tps)
+    log.info(
+        "Video: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
+        gen_elapsed,
+        ttft,
+        tps,
+    )
 
     response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
     parsed = _processor.parse_response(response)
@@ -1455,6 +1667,7 @@ def _video_generate_sync(req: VideoRequest) -> ChatResponse:
         parsed=parsed,
         raw=response if req.include_raw else None,
         model_path=str(_model_path) if _model_path else None,
+        time_to_first_token_seconds=ttft,
         tokens_per_second=tps,
     )
 
@@ -1528,12 +1741,14 @@ def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
         gen_kwargs["do_sample"],
         input_len,
     )
-    t_gen0 = time.perf_counter()
-    with _gen_lock:
-        outputs = _model.generate(**inputs, **gen_kwargs)
-    gen_elapsed = time.perf_counter() - t_gen0
+    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
     _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info("Audio: generate wall=%.3fs tokens_per_second=%s", gen_elapsed, tps)
+    log.info(
+        "Audio: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
+        gen_elapsed,
+        ttft,
+        tps,
+    )
 
     response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
     parsed = _processor.parse_response(response)
@@ -1542,6 +1757,7 @@ def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
         parsed=parsed,
         raw=response if req.include_raw else None,
         model_path=str(_model_path) if _model_path else None,
+        time_to_first_token_seconds=ttft,
         tokens_per_second=tps,
     )
 
@@ -1568,6 +1784,7 @@ def health():
         "model_loaded": ok,
         "model_kind": _model_kind,
         "image_endpoint": ok and _model_kind == "multimodal",
+        "audio_supported": bool(ok and _model_supports_audio),
         "images_dir": str(_default_images_dir()),
         "gpu": gpu_block,
         "error": _load_error,
@@ -1578,6 +1795,9 @@ def health():
             "GEMMA_MAX_MEMORY_CPU": os.environ.get("GEMMA_MAX_MEMORY_CPU", ""),
             "GEMMA_LOAD_4BIT": _truthy_env("GEMMA_LOAD_4BIT", False),
             "GEMMA_LOAD_8BIT": _truthy_env("GEMMA_LOAD_8BIT", False),
+            "GEMMA_VIDEO_NUM_FRAMES": os.environ.get("GEMMA_VIDEO_NUM_FRAMES", ""),
+            "GEMMA_VIDEO_MAX_SOFT_TOKENS": os.environ.get("GEMMA_VIDEO_MAX_SOFT_TOKENS", ""),
+            "GEMMA_IMAGE_MAX_SOFT_TOKENS": os.environ.get("GEMMA_IMAGE_MAX_SOFT_TOKENS", ""),
         },
     }
 
@@ -1697,6 +1917,15 @@ async def audio_chat(
             detail=(
                 "Audio input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
                 f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+            ),
+        )
+    if not _model_supports_audio:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "This checkpoint has no audio encoder (`audio_config` is null in config.json). "
+                "POST /audio requires a Gemma 4 release that ships audio tower weights; "
+                "your current model can still use /chat, /image, and /video if supported."
             ),
         )
 

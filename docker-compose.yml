@@ -10,9 +10,11 @@ services:
     ports:
       - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-5000}:${CONTAINER_PORT:-5000}"
     environment:
+      # Default `0` uses only the first GPU. For large models split across multiple GPUs (e.g. 31B on 2×L40S),
+      # set NVIDIA_VISIBLE_DEVICES=all (or `0,1`) in `.env` and use GEMMA_DEVICE_MAP=auto.
       NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-0}"
       NVIDIA_DRIVER_CAPABILITIES: "${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
-      # All weights on GPU 0 inside the container (see api_server / HF device_map).
+      # cuda0 = all weights on one GPU. For 31B+ on multi-GPU, use auto (see README).
       GEMMA_REQUIRE_GPU: "${GEMMA_REQUIRE_GPU:-1}"
       GEMMA_DEVICE_MAP: "${GEMMA_DEVICE_MAP:-cuda0}"
       GEMMA_MAX_MEMORY_GPU: "${GEMMA_MAX_MEMORY_GPU:-}"
@@ -27,6 +29,9 @@ services:
       GEMMA_IMAGES_DIR: "${GEMMA_IMAGES_DIR:-/images}"
       GEMMA_UPLOAD_TMP_DIR: "${GEMMA_UPLOAD_TMP_DIR:-}"
       GEMMA_USE_TORCHCODEC: "${GEMMA_USE_TORCHCODEC:-0}"
+      GEMMA_VIDEO_NUM_FRAMES: "${GEMMA_VIDEO_NUM_FRAMES:-}"
+      GEMMA_VIDEO_MAX_SOFT_TOKENS: "${GEMMA_VIDEO_MAX_SOFT_TOKENS:-}"
+      GEMMA_IMAGE_MAX_SOFT_TOKENS: "${GEMMA_IMAGE_MAX_SOFT_TOKENS:-}"
       GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
       # If full fp/bf16 model OOMs on your GPU, comment cuda0 and use auto + 4-bit instead:
       # GEMMA_DEVICE_MAP: "auto"
