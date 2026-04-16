@@ -7,8 +7,11 @@ Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load 
 - **`POST /chat`**: text → text (JSON or `multipart/form-data`)
 - **`POST /chat/stream`**: text → text (**streaming tokens** via SSE over HTTP)
 - **`POST /image`**: image + text → text (multimodal checkpoint required)
+- **`POST /image/stream`**: image + text → text (**streaming tokens** via SSE, multimodal required)
 - **`POST /video`**: video + text → text (multimodal checkpoint required)
+- **`POST /video/stream`**: video + text → text (**streaming tokens** via SSE, multimodal required)
 - **`POST /audio`**: audio + text → text (multimodal checkpoint required)
+- **`POST /audio/stream`**: audio + text → text (**streaming tokens** via SSE, multimodal + audio tower required)
 - **`GET /health`**: model/GPU status
 
 The **gemma-4-31B-it** checkpoint does not support audio (`POST /audio`).
