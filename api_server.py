@@ -52,7 +52,7 @@ import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 log = logging.getLogger(__name__)
@@ -1460,6 +1460,109 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
     )
 
 
+def _chat_stream_sse_events(req: ChatRequest):
+    """
+    Yield Server-Sent Events (SSE) for chat completion.
+
+    Event payloads are JSON strings:
+      - event: meta   data: {"model_path": "..."}
+      - event: token  data: {"text": "..."}
+      - event: done   data: {"raw": "...", "parsed": ..., "time_to_first_token_seconds": ..., "tokens_per_second": ...}
+      - event: error  data: {"detail": "..."}
+    """
+    assert _model is not None and _processor is not None
+
+    tokenizer = getattr(_processor, "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Processor has no tokenizer; streaming not available for this model.")
+
+    try:
+        from transformers import TextIteratorStreamer
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
+
+    messages = [m.model_dump() for m in req.messages]
+    prompt = _processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=req.enable_thinking,
+    )
+    inputs = _processor(text=prompt, return_tensors="pt").to(_inference_device())
+    input_len = int(inputs["input_ids"].shape[-1])
+
+    gen_kwargs = _build_generation_kwargs(
+        req.max_new_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.do_sample,
+    )
+
+    # Stream already-decoded incremental text to the client.
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=False,
+    )
+    gen_kwargs["streamer"] = streamer
+
+    # Start generation in a background thread; we yield streamer output in this thread.
+    t0 = time.perf_counter()
+
+    def _run_generate() -> None:
+        assert _model is not None
+        with _gen_lock:
+            _model.generate(**inputs, **gen_kwargs)
+
+    th = threading.Thread(target=_run_generate, name="chat-generate-stream", daemon=True)
+    th.start()
+
+    # Meta event first so the client can initialize UI/state.
+    yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
+
+    raw_parts: list[str] = []
+    ttft: float | None = None
+    n_chars = 0
+
+    try:
+        for chunk in streamer:
+            if ttft is None:
+                ttft = round(time.perf_counter() - t0, 4)
+            if not chunk:
+                continue
+            raw_parts.append(chunk)
+            n_chars += len(chunk)
+            yield "event: token\ndata: " + json.dumps({"text": chunk}) + "\n\n"
+    except Exception as e:
+        yield "event: error\ndata: " + json.dumps({"detail": f"{e.__class__.__name__}: {e}"}) + "\n\n"
+        return
+    finally:
+        th.join(timeout=0.1)
+
+    raw = "".join(raw_parts)
+    parsed = _processor.parse_response(raw)
+
+    elapsed = max(1e-9, time.perf_counter() - t0)
+    # This is a coarse rate (chars/sec). True tokens/sec requires token counts; we keep API shape consistent.
+    cps = round(n_chars / elapsed, 3)
+
+    yield (
+        "event: done\ndata: "
+        + json.dumps(
+            {
+                "raw": raw if req.include_raw else None,
+                "parsed": parsed,
+                "model_path": str(_model_path) if _model_path else None,
+                "time_to_first_token_seconds": ttft,
+                "tokens_per_second": None,
+                "chars_per_second": cps,
+            }
+        )
+        + "\n\n"
+    )
+
+
 def _image_content_block(req: ImageRequest) -> dict[str, str]:
     u = (req.image_url or "").strip()
     f = (req.image_file or "").strip()
@@ -1822,6 +1925,37 @@ async def chat(
         req = _parse_json_model(ChatRequest, body, route="POST /chat")  # type: ignore[assignment]
 
     return await anyio.to_thread.run_sync(lambda: _generate_sync(req))
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+
+    ct = (request.headers.get("content-type") or "").lower()
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req = await _chat_request_from_multipart(request)
+    else:
+        req = _parse_json_model(ChatRequest, body, route="POST /chat/stream")  # type: ignore[assignment]
+
+    return StreamingResponse(
+        _chat_stream_sse_events(req),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Helps reverse proxies (nginx) not buffer; harmless otherwise.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/image", response_model=ChatResponse)

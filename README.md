@@ -5,6 +5,7 @@ Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load 
 ### Endpoints
 
 - **`POST /chat`**: text → text (JSON or `multipart/form-data`)
+- **`POST /chat/stream`**: text → text (**streaming tokens** via SSE over HTTP)
 - **`POST /image`**: image + text → text (multimodal checkpoint required)
 - **`POST /video`**: video + text → text (multimodal checkpoint required)
 - **`POST /audio`**: audio + text → text (multimodal checkpoint required)
@@ -65,6 +66,16 @@ curl -sS -X POST "http://99.64.152.85:5000/chat" \
 curl -sS -X POST "http://99.64.152.85:5000/chat" \
   -F 'messages=[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Reply with exactly three words."}]' \
   -F "max_new_tokens=64"
+```
+
+### `POST /chat/stream` (stream tokens)
+
+This endpoint streams **incremental text** as Server-Sent Events (SSE). In the browser you usually consume it using `fetch()` + `ReadableStream` (not `EventSource`, because `EventSource` only supports GET).
+
+```bash
+curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Write a short poem about rain."}],"max_new_tokens":128}'
 ```
 
 ### `POST /image`
