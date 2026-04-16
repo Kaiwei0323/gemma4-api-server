@@ -4,6 +4,7 @@
 # Large local model checkpoints (bind-mount only)
 gemma-4-E4B-it/
 gemma-4-31B-it/
+gemma-4-E2B-it/
 
 # Python / tooling noise
 __pycache__/

@@ -52,7 +52,7 @@ import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 log = logging.getLogger(__name__)
@@ -1460,6 +1460,227 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
     )
 
 
+def _chat_stream_sse_events(req: ChatRequest):
+    """
+    Yield Server-Sent Events (SSE) for chat completion.
+
+    Event payloads are JSON strings:
+      - event: meta   data: {"model_path": "..."}
+      - event: token  data: {"text": "..."}
+      - event: done   data: {"raw": "...", "parsed": ..., "time_to_first_token_seconds": ..., "tokens_per_second": ...}
+      - event: error  data: {"detail": "..."}
+    """
+    assert _model is not None and _processor is not None
+
+    tokenizer = getattr(_processor, "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Processor has no tokenizer; streaming not available for this model.")
+
+    try:
+        from transformers import TextIteratorStreamer
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
+
+    class _CountingTextIteratorStreamer(TextIteratorStreamer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prompt_len: int | None = None
+            self.new_token_count: int = 0
+
+        def put(self, value):  # type: ignore[override]
+            # `generate` first sends the full prompt `input_ids`, then sends generated token ids per step.
+            try:
+                n = int(getattr(value, "shape", [0])[-1]) if value is not None else 0
+            except Exception:
+                n = 0
+            if self.prompt_len is None:
+                self.prompt_len = n
+            else:
+                self.new_token_count += max(0, n)
+            return super().put(value)
+
+    messages = [m.model_dump() for m in req.messages]
+    prompt = _processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=req.enable_thinking,
+    )
+    inputs = _processor(text=prompt, return_tensors="pt").to(_inference_device())
+    input_len = int(inputs["input_ids"].shape[-1])
+
+    gen_kwargs = _build_generation_kwargs(
+        req.max_new_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.do_sample,
+    )
+
+    # Stream already-decoded incremental text to the client.
+    streamer = _CountingTextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=False,
+    )
+    gen_kwargs["streamer"] = streamer
+
+    # Start generation in a background thread; we yield streamer output in this thread.
+    t0 = time.perf_counter()
+
+    def _run_generate() -> None:
+        assert _model is not None
+        with _gen_lock:
+            _model.generate(**inputs, **gen_kwargs)
+
+    th = threading.Thread(target=_run_generate, name="chat-generate-stream", daemon=True)
+    th.start()
+
+    # Meta event first so the client can initialize UI/state.
+    yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
+
+    raw_parts: list[str] = []
+    ttft: float | None = None
+    n_chars = 0
+
+    try:
+        for chunk in streamer:
+            if ttft is None:
+                ttft = round(time.perf_counter() - t0, 4)
+            if not chunk:
+                continue
+            raw_parts.append(chunk)
+            n_chars += len(chunk)
+            yield "event: token\ndata: " + json.dumps({"text": chunk}) + "\n\n"
+    except Exception as e:
+        yield "event: error\ndata: " + json.dumps({"detail": f"{e.__class__.__name__}: {e}"}) + "\n\n"
+        return
+    finally:
+        th.join(timeout=0.1)
+
+    raw = "".join(raw_parts)
+    parsed = _processor.parse_response(raw)
+
+    elapsed = max(1e-9, time.perf_counter() - t0)
+    cps = round(n_chars / elapsed, 3)
+    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
+
+    yield (
+        "event: done\ndata: "
+        + json.dumps(
+            {
+                "raw": raw if req.include_raw else None,
+                "parsed": parsed,
+                "model_path": str(_model_path) if _model_path else None,
+                "time_to_first_token_seconds": ttft,
+                "tokens_per_second": tps,
+                "chars_per_second": cps,
+            }
+        )
+        + "\n\n"
+    )
+
+
+def _generate_stream_sse_from_inputs(
+    *,
+    inputs: Any,
+    gen_kwargs: dict[str, Any],
+    include_raw: bool,
+):
+    """
+    Shared SSE streamer for any already-prepared `inputs` compatible with `_model.generate(**inputs, ...)`.
+    """
+    assert _model is not None and _processor is not None
+
+    tokenizer = getattr(_processor, "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Processor has no tokenizer; streaming not available for this model.")
+
+    try:
+        from transformers import TextIteratorStreamer
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
+
+    class _CountingTextIteratorStreamer(TextIteratorStreamer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prompt_len: int | None = None
+            self.new_token_count: int = 0
+
+        def put(self, value):  # type: ignore[override]
+            try:
+                n = int(getattr(value, "shape", [0])[-1]) if value is not None else 0
+            except Exception:
+                n = 0
+            if self.prompt_len is None:
+                self.prompt_len = n
+            else:
+                self.new_token_count += max(0, n)
+            return super().put(value)
+
+    streamer = _CountingTextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=False,
+    )
+
+    merged = dict(gen_kwargs)
+    merged["streamer"] = streamer
+
+    t0 = time.perf_counter()
+
+    def _run_generate() -> None:
+        assert _model is not None
+        with _gen_lock:
+            _model.generate(**inputs, **merged)
+
+    th = threading.Thread(target=_run_generate, name="generate-stream", daemon=True)
+    th.start()
+
+    yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
+
+    raw_parts: list[str] = []
+    ttft: float | None = None
+    n_chars = 0
+
+    try:
+        for chunk in streamer:
+            if ttft is None:
+                ttft = round(time.perf_counter() - t0, 4)
+            if not chunk:
+                continue
+            raw_parts.append(chunk)
+            n_chars += len(chunk)
+            yield "event: token\ndata: " + json.dumps({"text": chunk}) + "\n\n"
+    except Exception as e:
+        yield "event: error\ndata: " + json.dumps({"detail": f"{e.__class__.__name__}: {e}"}) + "\n\n"
+        return
+    finally:
+        th.join(timeout=0.1)
+
+    raw = "".join(raw_parts)
+    parsed = _processor.parse_response(raw)
+
+    elapsed = max(1e-9, time.perf_counter() - t0)
+    cps = round(n_chars / elapsed, 3)
+    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
+
+    yield (
+        "event: done\ndata: "
+        + json.dumps(
+            {
+                "raw": raw if include_raw else None,
+                "parsed": parsed,
+                "model_path": str(_model_path) if _model_path else None,
+                "time_to_first_token_seconds": ttft,
+                "tokens_per_second": tps,
+                "chars_per_second": cps,
+            }
+        )
+        + "\n\n"
+    )
+
+
 def _image_content_block(req: ImageRequest) -> dict[str, str]:
     u = (req.image_url or "").strip()
     f = (req.image_file or "").strip()
@@ -1824,6 +2045,37 @@ async def chat(
     return await anyio.to_thread.run_sync(lambda: _generate_sync(req))
 
 
+@app.post("/chat/stream")
+async def chat_stream(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+
+    ct = (request.headers.get("content-type") or "").lower()
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req = await _chat_request_from_multipart(request)
+    else:
+        req = _parse_json_model(ChatRequest, body, route="POST /chat/stream")  # type: ignore[assignment]
+
+    return StreamingResponse(
+        _chat_stream_sse_events(req),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Helps reverse proxies (nginx) not buffer; harmless otherwise.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/image", response_model=ChatResponse)
 async def image_chat(
     request: Request,
@@ -1866,6 +2118,92 @@ async def image_chat(
                 log.warning("Image: could not delete temp upload: %s", tmp_path)
 
 
+@app.post("/image/stream")
+async def image_chat_stream(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+    if _model_kind != "multimodal":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Image input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
+                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+            ),
+        )
+
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path, _ = await _image_request_from_multipart(request)
+    else:
+        req = _parse_json_model(ImageRequest, body, route="POST /image/stream")  # type: ignore[assignment]
+
+    assert req is not None
+    image_block = _image_content_block(req)
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    image_block,
+                    {"type": "text", "text": req.text},
+                ],
+            }
+        ]
+        tpl_kw: dict[str, Any] = {
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+            "add_generation_prompt": True,
+        }
+        mm_pk = _processor_kwargs_for_image(req)
+        try:
+            if mm_pk:
+                inputs = _processor.apply_chat_template(
+                    messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
+                )
+            else:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw, enable_thinking=req.enable_thinking)
+        except TypeError:
+            if mm_pk:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
+            else:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw)
+
+        inputs = inputs.to(_inference_device())
+        gen_kwargs = _build_generation_kwargs(
+            req.max_new_tokens,
+            req.temperature,
+            req.top_p,
+            req.top_k,
+            req.do_sample,
+        )
+
+        return StreamingResponse(
+            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Image(stream): could not delete temp upload: %s", tmp_path)
+
+
 @app.post("/video", response_model=ChatResponse)
 async def video_chat(
     request: Request,
@@ -1902,6 +2240,115 @@ async def video_chat(
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 log.warning("Video: could not delete temp upload: %s", tmp_path)
+
+
+@app.post("/video/stream")
+async def video_chat_stream(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+    if _model_kind != "multimodal":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Video input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
+                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+            ),
+        )
+
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path = await _video_request_from_multipart(request)
+    else:
+        req = _parse_json_model(VideoRequest, body, route="POST /video/stream")  # type: ignore[assignment]
+
+    upload_path = (req.video_upload_path or "").strip()
+    video_url = (req.video_url or "").strip()
+    if upload_path:
+        p = Path(upload_path).expanduser().resolve()
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded video not found: {p}")
+        video_ref = str(p)
+    else:
+        if not video_url:
+            raise HTTPException(status_code=400, detail="video_url is required")
+        _validate_remote_media_url(video_url, kind="video")
+        video_ref = video_url
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": video_ref},
+                {"type": "text", "text": req.text},
+            ],
+        }
+    ]
+    tpl_kw: dict[str, Any] = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
+    mm_pk = _processor_kwargs_for_video(req)
+    try:
+        try:
+            if mm_pk:
+                inputs = _processor.apply_chat_template(
+                    messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
+                )
+            else:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw, enable_thinking=req.enable_thinking)
+        except TypeError:
+            if mm_pk:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
+            else:
+                inputs = _processor.apply_chat_template(messages, **tpl_kw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Video(stream): processor/apply_chat_template failed")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to fetch/process video input inside the server. "
+                f"{e.__class__.__name__}: {e}"
+            ),
+        )
+
+    inputs = inputs.to(_inference_device())
+    gen_kwargs = _build_generation_kwargs(
+        req.max_new_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.do_sample,
+    )
+
+    try:
+        return StreamingResponse(
+            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Video(stream): could not delete temp upload: %s", tmp_path)
 
 
 @app.post("/audio", response_model=ChatResponse)
@@ -1949,6 +2396,114 @@ async def audio_chat(
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 log.warning("Audio: could not delete temp upload: %s", tmp_path)
+
+
+@app.post("/audio/stream")
+async def audio_chat_stream(
+    request: Request,
+    _: None = Depends(require_api_key),
+):
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+    if _model_kind != "multimodal":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Audio input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
+                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+            ),
+        )
+    if not _model_supports_audio:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "This checkpoint has no audio encoder (`audio_config` is null in config.json). "
+                "POST /audio/stream requires a Gemma 4 release that ships audio tower weights."
+            ),
+        )
+
+    ct = (request.headers.get("content-type") or "").lower()
+    tmp_path: Path | None = None
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
+    if is_multipart:
+        req, tmp_path = await _audio_request_from_multipart(request)
+    else:
+        req = _parse_json_model(AudioRequest, body, route="POST /audio/stream")  # type: ignore[assignment]
+
+    upload_path = (req.audio_upload_path or "").strip()
+    audio_url = (req.audio_url or "").strip()
+    if upload_path:
+        p = Path(upload_path).expanduser().resolve()
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded audio not found: {p}")
+        audio_ref = str(p)
+    else:
+        if not audio_url:
+            raise HTTPException(status_code=400, detail="audio_url is required")
+        _validate_remote_media_url(audio_url, kind="audio")
+        audio_ref = audio_url
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": audio_ref},
+                {"type": "text", "text": req.text},
+            ],
+        }
+    ]
+    tpl_kw: dict[str, Any] = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
+    try:
+        try:
+            inputs = _processor.apply_chat_template(messages, **tpl_kw, enable_thinking=req.enable_thinking)
+        except TypeError:
+            inputs = _processor.apply_chat_template(messages, **tpl_kw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Audio(stream): processor/apply_chat_template failed")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to fetch/process audio input inside the server. "
+                f"{e.__class__.__name__}: {e}"
+            ),
+        )
+
+    inputs = inputs.to(_inference_device())
+    gen_kwargs = _build_generation_kwargs(
+        req.max_new_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.do_sample,
+    )
+
+    try:
+        return StreamingResponse(
+            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("Audio(stream): could not delete temp upload: %s", tmp_path)
 
 
 @app.get("/")

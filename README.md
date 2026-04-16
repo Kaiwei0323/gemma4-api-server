@@ -5,9 +5,13 @@ Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load 
 ### Endpoints
 
 - **`POST /chat`**: text → text (JSON or `multipart/form-data`)
+- **`POST /chat/stream`**: text → text (**streaming tokens** via SSE over HTTP)
 - **`POST /image`**: image + text → text (multimodal checkpoint required)
+- **`POST /image/stream`**: image + text → text (**streaming tokens** via SSE, multimodal required)
 - **`POST /video`**: video + text → text (multimodal checkpoint required)
+- **`POST /video/stream`**: video + text → text (**streaming tokens** via SSE, multimodal required)
 - **`POST /audio`**: audio + text → text (multimodal checkpoint required)
+- **`POST /audio/stream`**: audio + text → text (**streaming tokens** via SSE, multimodal + audio tower required)
 - **`GET /health`**: model/GPU status
 
 The **gemma-4-31B-it** checkpoint does not support audio (`POST /audio`).
@@ -67,10 +71,29 @@ curl -sS -X POST "http://99.64.152.85:5000/chat" \
   -F "max_new_tokens=64"
 ```
 
+### `POST /chat/stream` (stream tokens)
+
+This endpoint streams **incremental text** as Server-Sent Events (SSE). In the browser you usually consume it using `fetch()` + `ReadableStream` (not `EventSource`, because `EventSource` only supports GET).
+
+```bash
+curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Write a short poem about rain."}],"max_new_tokens":128}'
+```
+
 ### `POST /image`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/image"   -F "text=Describe this."   -F "image_file=@images/eiffel_tower.jpg"   -F "max_new_tokens=128"
+```
+
+### `POST /image/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://99.64.152.85:5000/image/stream" ^
+  -F "text=Describe this." ^
+  -F "image_file=@images/eiffel_tower.jpg" ^
+  -F "max_new_tokens=128"
 ```
 
 ### `POST /video`
@@ -82,11 +105,29 @@ curl -sS -X POST "http://99.64.152.85:5000/video" \
   -F "max_new_tokens=256"
 ```
 
+### `POST /video/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://99.64.152.85:5000/video/stream" ^
+  -F "text=Describe this video." ^
+  -F "video_url=@videos/ForBiggerBlazes.mp4" ^
+  -F "max_new_tokens=256"
+```
+
 ### `POST /audio`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/audio" \
   -F "text=Transcribe the following speech segment in its original language. Only output the transcription, with no newlines." \
   -F "audio_url=@audios/Demos_sample-data_journal1.wav" \
+  -F "max_new_tokens=256"
+```
+
+### `POST /audio/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://99.64.152.85:5000/audio/stream" ^
+  -F "text=Transcribe. Only output the transcription." ^
+  -F "audio_url=@audios/Demos_sample-data_journal1.wav" ^
   -F "max_new_tokens=256"
 ```
