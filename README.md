@@ -87,6 +87,15 @@ curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
 curl -sS -X POST "http://99.64.152.85:5000/image"   -F "text=Describe this."   -F "image_file=@images/eiffel_tower.jpg"   -F "max_new_tokens=128"
 ```
 
+### `POST /image/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://localhost:5000/image/stream" ^
+  -F "text=Describe this." ^
+  -F "image_file=@images/eiffel_tower.jpg" ^
+  -F "max_new_tokens=128"
+```
+
 ### `POST /video`
 
 ```bash
@@ -96,11 +105,29 @@ curl -sS -X POST "http://99.64.152.85:5000/video" \
   -F "max_new_tokens=256"
 ```
 
+### `POST /video/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://localhost:5000/video/stream" ^
+  -F "text=Describe this video." ^
+  -F "video_url=@videos/ForBiggerBlazes.mp4" ^
+  -F "max_new_tokens=256"
+```
+
 ### `POST /audio`
 
 ```bash
 curl -sS -X POST "http://99.64.152.85:5000/audio" \
   -F "text=Transcribe the following speech segment in its original language. Only output the transcription, with no newlines." \
   -F "audio_url=@audios/Demos_sample-data_journal1.wav" \
+  -F "max_new_tokens=256"
+```
+
+### `POST /audio/stream` (stream tokens)
+
+```cmd
+curl -N -X POST "http://localhost:5000/audio/stream" ^
+  -F "text=Transcribe. Only output the transcription." ^
+  -F "audio_url=@audios/Demos_sample-data_journal1.wav" ^
   -F "max_new_tokens=256"
 ```
