@@ -1481,6 +1481,24 @@ def _chat_stream_sse_events(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
 
+    class _CountingTextIteratorStreamer(TextIteratorStreamer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prompt_len: int | None = None
+            self.new_token_count: int = 0
+
+        def put(self, value):  # type: ignore[override]
+            # `generate` first sends the full prompt `input_ids`, then sends generated token ids per step.
+            try:
+                n = int(getattr(value, "shape", [0])[-1]) if value is not None else 0
+            except Exception:
+                n = 0
+            if self.prompt_len is None:
+                self.prompt_len = n
+            else:
+                self.new_token_count += max(0, n)
+            return super().put(value)
+
     messages = [m.model_dump() for m in req.messages]
     prompt = _processor.apply_chat_template(
         messages,
@@ -1500,7 +1518,7 @@ def _chat_stream_sse_events(req: ChatRequest):
     )
 
     # Stream already-decoded incremental text to the client.
-    streamer = TextIteratorStreamer(
+    streamer = _CountingTextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
         skip_special_tokens=False,
@@ -1544,8 +1562,8 @@ def _chat_stream_sse_events(req: ChatRequest):
     parsed = _processor.parse_response(raw)
 
     elapsed = max(1e-9, time.perf_counter() - t0)
-    # This is a coarse rate (chars/sec). True tokens/sec requires token counts; we keep API shape consistent.
     cps = round(n_chars / elapsed, 3)
+    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
 
     yield (
         "event: done\ndata: "
@@ -1555,7 +1573,7 @@ def _chat_stream_sse_events(req: ChatRequest):
                 "parsed": parsed,
                 "model_path": str(_model_path) if _model_path else None,
                 "time_to_first_token_seconds": ttft,
-                "tokens_per_second": None,
+                "tokens_per_second": tps,
                 "chars_per_second": cps,
             }
         )
@@ -1583,7 +1601,24 @@ def _generate_stream_sse_from_inputs(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
 
-    streamer = TextIteratorStreamer(
+    class _CountingTextIteratorStreamer(TextIteratorStreamer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prompt_len: int | None = None
+            self.new_token_count: int = 0
+
+        def put(self, value):  # type: ignore[override]
+            try:
+                n = int(getattr(value, "shape", [0])[-1]) if value is not None else 0
+            except Exception:
+                n = 0
+            if self.prompt_len is None:
+                self.prompt_len = n
+            else:
+                self.new_token_count += max(0, n)
+            return super().put(value)
+
+    streamer = _CountingTextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
         skip_special_tokens=False,
@@ -1628,6 +1663,7 @@ def _generate_stream_sse_from_inputs(
 
     elapsed = max(1e-9, time.perf_counter() - t0)
     cps = round(n_chars / elapsed, 3)
+    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
 
     yield (
         "event: done\ndata: "
@@ -1637,7 +1673,7 @@ def _generate_stream_sse_from_inputs(
                 "parsed": parsed,
                 "model_path": str(_model_path) if _model_path else None,
                 "time_to_first_token_seconds": ttft,
-                "tokens_per_second": None,
+                "tokens_per_second": tps,
                 "chars_per_second": cps,
             }
         )
