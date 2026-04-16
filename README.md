@@ -90,7 +90,7 @@ curl -sS -X POST "http://99.64.152.85:5000/image"   -F "text=Describe this."   -
 ### `POST /image/stream` (stream tokens)
 
 ```cmd
-curl -N -X POST "http://localhost:5000/image/stream" ^
+curl -N -X POST "http://99.64.152.85:5000/image/stream" ^
   -F "text=Describe this." ^
   -F "image_file=@images/eiffel_tower.jpg" ^
   -F "max_new_tokens=128"
@@ -108,7 +108,7 @@ curl -sS -X POST "http://99.64.152.85:5000/video" \
 ### `POST /video/stream` (stream tokens)
 
 ```cmd
-curl -N -X POST "http://localhost:5000/video/stream" ^
+curl -N -X POST "http://99.64.152.85:5000/video/stream" ^
   -F "text=Describe this video." ^
   -F "video_url=@videos/ForBiggerBlazes.mp4" ^
   -F "max_new_tokens=256"
@@ -126,7 +126,7 @@ curl -sS -X POST "http://99.64.152.85:5000/audio" \
 ### `POST /audio/stream` (stream tokens)
 
 ```cmd
-curl -N -X POST "http://localhost:5000/audio/stream" ^
+curl -N -X POST "http://99.64.152.85:5000/audio/stream" ^
   -F "text=Transcribe. Only output the transcription." ^
   -F "audio_url=@audios/Demos_sample-data_journal1.wav" ^
   -F "max_new_tokens=256"
