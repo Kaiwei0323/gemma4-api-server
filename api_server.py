@@ -1050,7 +1050,7 @@ def _load_model() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     _configure_logging_for_docker()
     _startup_echo(
         "stage=uvicorn_lifespan_enter — next: load processor + model (see STARTUP lines; this blocks until done)"
@@ -1075,7 +1075,7 @@ app = FastAPI(title="Gemma 4 local chat API", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
-async def _request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def _request_validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
     # Default handler tries to json-encode pydantic errors verbatim; `input` may contain raw multipart bytes.
     return JSONResponse(
         status_code=422,
@@ -1460,127 +1460,6 @@ def _generate_sync(req: ChatRequest) -> ChatResponse:
     )
 
 
-def _chat_stream_sse_events(req: ChatRequest):
-    """
-    Yield Server-Sent Events (SSE) for chat completion.
-
-    Event payloads are JSON strings:
-      - event: meta   data: {"model_path": "..."}
-      - event: token  data: {"text": "..."}
-      - event: done   data: {"raw": "...", "parsed": ..., "time_to_first_token_seconds": ..., "tokens_per_second": ...}
-      - event: error  data: {"detail": "..."}
-    """
-    assert _model is not None and _processor is not None
-
-    tokenizer = getattr(_processor, "tokenizer", None)
-    if tokenizer is None:
-        raise HTTPException(status_code=500, detail="Processor has no tokenizer; streaming not available for this model.")
-
-    try:
-        from transformers import TextIteratorStreamer
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Streaming requires transformers TextIteratorStreamer: {e}")
-
-    class _CountingTextIteratorStreamer(TextIteratorStreamer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.prompt_len: int | None = None
-            self.new_token_count: int = 0
-
-        def put(self, value):  # type: ignore[override]
-            # `generate` first sends the full prompt `input_ids`, then sends generated token ids per step.
-            try:
-                n = int(getattr(value, "shape", [0])[-1]) if value is not None else 0
-            except Exception:
-                n = 0
-            if self.prompt_len is None:
-                self.prompt_len = n
-            else:
-                self.new_token_count += max(0, n)
-            return super().put(value)
-
-    messages = [m.model_dump() for m in req.messages]
-    prompt = _processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=req.enable_thinking,
-    )
-    inputs = _processor(text=prompt, return_tensors="pt").to(_inference_device())
-    input_len = int(inputs["input_ids"].shape[-1])
-
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    # Stream already-decoded incremental text to the client.
-    streamer = _CountingTextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,
-    )
-    gen_kwargs["streamer"] = streamer
-
-    # Start generation in a background thread; we yield streamer output in this thread.
-    t0 = time.perf_counter()
-
-    def _run_generate() -> None:
-        assert _model is not None
-        with _gen_lock:
-            _model.generate(**inputs, **gen_kwargs)
-
-    th = threading.Thread(target=_run_generate, name="chat-generate-stream", daemon=True)
-    th.start()
-
-    # Meta event first so the client can initialize UI/state.
-    yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
-
-    raw_parts: list[str] = []
-    ttft: float | None = None
-    n_chars = 0
-
-    try:
-        for chunk in streamer:
-            if ttft is None:
-                ttft = round(time.perf_counter() - t0, 4)
-            if not chunk:
-                continue
-            raw_parts.append(chunk)
-            n_chars += len(chunk)
-            yield "event: token\ndata: " + json.dumps({"text": chunk}) + "\n\n"
-    except Exception as e:
-        yield "event: error\ndata: " + json.dumps({"detail": f"{e.__class__.__name__}: {e}"}) + "\n\n"
-        return
-    finally:
-        th.join(timeout=0.1)
-
-    raw = "".join(raw_parts)
-    parsed = _processor.parse_response(raw)
-
-    elapsed = max(1e-9, time.perf_counter() - t0)
-    cps = round(n_chars / elapsed, 3)
-    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
-
-    yield (
-        "event: done\ndata: "
-        + json.dumps(
-            {
-                "raw": raw if req.include_raw else None,
-                "parsed": parsed,
-                "model_path": str(_model_path) if _model_path else None,
-                "time_to_first_token_seconds": ttft,
-                "tokens_per_second": tps,
-                "chars_per_second": cps,
-            }
-        )
-        + "\n\n"
-    )
-
-
 def _generate_stream_sse_from_inputs(
     *,
     inputs: Any,
@@ -1678,6 +1557,41 @@ def _generate_stream_sse_from_inputs(
             }
         )
         + "\n\n"
+    )
+
+
+def _chat_stream_sse_events(req: ChatRequest):
+    """
+    Yield Server-Sent Events (SSE) for chat completion.
+
+    Event payloads are JSON strings:
+      - event: meta   data: {"model_path": "..."}
+      - event: token  data: {"text": "..."}
+      - event: done   data: {"raw": "...", "parsed": ..., "time_to_first_token_seconds": ..., "tokens_per_second": ...}
+      - event: error  data: {"detail": "..."}
+    """
+    assert _model is not None and _processor is not None
+
+    messages = [m.model_dump() for m in req.messages]
+    prompt = _processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=req.enable_thinking,
+    )
+    inputs = _processor(text=prompt, return_tensors="pt").to(_inference_device())
+
+    gen_kwargs = _build_generation_kwargs(
+        req.max_new_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.do_sample,
+    )
+    yield from _generate_stream_sse_from_inputs(
+        inputs=inputs,
+        gen_kwargs=gen_kwargs,
+        include_raw=req.include_raw,
     )
 
 
