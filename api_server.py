@@ -43,7 +43,7 @@ import threading
 import time
 import uuid
 import json
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -56,6 +56,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 log = logging.getLogger(__name__)
+
+def _perf_enabled() -> bool:
+    return _truthy_env("GEMMA_PERF_LOG", False)
+
+
+def _perf(msg: str, *args: Any) -> None:
+    if _perf_enabled():
+        log.info("PERF " + msg, *args)
 
 
 def _configure_logging_for_docker() -> None:
@@ -857,6 +865,7 @@ def _load_model() -> None:
         return
 
     _apply_transformers_runtime_patches()
+    _configure_torch_runtime_for_inference()
 
     require_gpu = _truthy_env("GEMMA_REQUIRE_GPU", True)
     if require_gpu and not torch.cuda.is_available():
@@ -1029,6 +1038,10 @@ def _load_model() -> None:
         return
 
     _processor = processor
+    try:
+        model.eval()
+    except Exception:
+        pass
     _model = model
     _model_path = path
     _load_error = None
@@ -1171,7 +1184,8 @@ def _generate_with_ttft(inputs: Any, gen_kwargs: dict[str, Any]) -> tuple[Any, f
 
     assert _model is not None
     with _gen_lock:
-        outputs = _model.generate(**inputs, **merged)
+        with _inference_context():
+            outputs = _model.generate(**inputs, **merged)
     gen_elapsed = time.perf_counter() - t_gen0
     ttft = round(hook.seconds, 4) if hook.seconds is not None else None
     return outputs, ttft, gen_elapsed
@@ -1386,6 +1400,71 @@ def _inference_device() -> Any:
     return next(_model.parameters()).device
 
 
+def _configure_torch_runtime_for_inference() -> None:
+    """
+    Enable faster CUDA kernels when available.
+
+    Safe to call multiple times; no-op on CPU-only.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+
+    if not torch.cuda.is_available():
+        return
+
+    # TF32 is a big win on modern NVIDIA GPUs for matmul-heavy models.
+    if _truthy_env("GEMMA_ENABLE_TF32", True):
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    # Prefer fused scaled-dot-product attention implementations when possible.
+    # (PyTorch will fall back automatically if unsupported.)
+    if _truthy_env("GEMMA_ENABLE_SDPA", True):
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)  # type: ignore[attr-defined]
+            torch.backends.cuda.enable_mem_efficient_sdp(True)  # type: ignore[attr-defined]
+            # Keep math SDPA enabled as a compatibility fallback. Some models / shapes
+            # (e.g. GQA or large head_dim) cannot use fused kernels and require math SDPA.
+            if _truthy_env("GEMMA_DISABLE_MATH_SDPA", False):
+                torch.backends.cuda.enable_math_sdp(False)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _inference_context():
+    """
+    Inference-only context shared by all endpoints.
+
+    - torch.inference_mode(): disables autograd overhead
+    - autocast(cuda): bf16/fp16 kernels for faster decode
+    """
+    try:
+        import torch
+    except Exception:
+        return nullcontext()
+
+    stack = ExitStack()
+    stack.enter_context(torch.inference_mode())
+
+    if torch.cuda.is_available() and _truthy_env("GEMMA_USE_AUTOCAST", True):
+        dtype_raw = os.environ.get("GEMMA_AUTOCAST_DTYPE", "bf16").strip().lower()
+        if dtype_raw in ("fp16", "float16", "half"):
+            dtype = torch.float16
+        else:
+            dtype = torch.bfloat16
+        stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
+    return stack
+
+
 def _build_generation_kwargs(
     max_new_tokens: int,
     temperature: float | None,
@@ -1507,14 +1586,24 @@ def _generate_stream_sse_from_inputs(
     merged["streamer"] = streamer
 
     t0 = time.perf_counter()
+    t_started: float | None = None
 
     def _run_generate() -> None:
         assert _model is not None
+        nonlocal t_started
+        t_started = time.perf_counter()
         with _gen_lock:
-            _model.generate(**inputs, **merged)
+            with _inference_context():
+                _model.generate(**inputs, **merged)
 
     th = threading.Thread(target=_run_generate, name="generate-stream", daemon=True)
     th.start()
+    _perf(
+        "stream_generate_thread_started delay_ms=%.2f max_new_tokens=%s do_sample=%s",
+        (time.perf_counter() - t0) * 1000.0,
+        merged.get("max_new_tokens"),
+        merged.get("do_sample"),
+    )
 
     yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
 
@@ -1526,6 +1615,11 @@ def _generate_stream_sse_from_inputs(
         for chunk in streamer:
             if ttft is None:
                 ttft = round(time.perf_counter() - t0, 4)
+                _perf(
+                    "stream_first_chunk ttft_s=%s thread_start_delay_ms=%.2f",
+                    ttft,
+                    ((t_started - t0) * 1000.0) if t_started is not None else -1.0,
+                )
             if not chunk:
                 continue
             raw_parts.append(chunk)
@@ -1572,6 +1666,7 @@ def _chat_stream_sse_events(req: ChatRequest):
     """
     assert _model is not None and _processor is not None
 
+    t0 = time.perf_counter()
     messages = [m.model_dump() for m in req.messages]
     prompt = _processor.apply_chat_template(
         messages,
@@ -1579,7 +1674,22 @@ def _chat_stream_sse_events(req: ChatRequest):
         add_generation_prompt=True,
         enable_thinking=req.enable_thinking,
     )
-    inputs = _processor(text=prompt, return_tensors="pt").to(_inference_device())
+    t_prompt = time.perf_counter()
+    inputs = _processor(text=prompt, return_tensors="pt")
+    t_tok = time.perf_counter()
+    inputs = inputs.to(_inference_device())
+    t_to = time.perf_counter()
+    try:
+        input_len = int(inputs["input_ids"].shape[-1])
+    except Exception:
+        input_len = -1
+    _perf(
+        "chat_stream_prepare prompt_ms=%.2f tokenize_ms=%.2f to_device_ms=%.2f input_len=%s",
+        (t_prompt - t0) * 1000.0,
+        (t_tok - t_prompt) * 1000.0,
+        (t_to - t_tok) * 1000.0,
+        input_len,
+    )
 
     gen_kwargs = _build_generation_kwargs(
         req.max_new_tokens,
@@ -2063,6 +2173,7 @@ async def image_chat_stream(
     assert req is not None
     image_block = _image_content_block(req)
     try:
+        t0 = time.perf_counter()
         messages = [
             {
                 "role": "user",
@@ -2092,7 +2203,19 @@ async def image_chat_stream(
             else:
                 inputs = _processor.apply_chat_template(messages, **tpl_kw)
 
+        t_tpl = time.perf_counter()
         inputs = inputs.to(_inference_device())
+        t_to = time.perf_counter()
+        try:
+            input_len = int(inputs["input_ids"].shape[-1])
+        except Exception:
+            input_len = -1
+        _perf(
+            "image_stream_prepare template_ms=%.2f to_device_ms=%.2f input_len=%s",
+            (t_tpl - t0) * 1000.0,
+            (t_to - t_tpl) * 1000.0,
+            input_len,
+        )
         gen_kwargs = _build_generation_kwargs(
             req.max_new_tokens,
             req.temperature,
@@ -2206,6 +2329,7 @@ async def video_chat_stream(
             ],
         }
     ]
+    t0 = time.perf_counter()
     tpl_kw: dict[str, Any] = {
         "tokenize": True,
         "return_dict": True,
@@ -2238,7 +2362,19 @@ async def video_chat_stream(
             ),
         )
 
+    t_tpl = time.perf_counter()
     inputs = inputs.to(_inference_device())
+    t_to = time.perf_counter()
+    try:
+        input_len = int(inputs["input_ids"].shape[-1])
+    except Exception:
+        input_len = -1
+    _perf(
+        "video_stream_prepare template_ms=%.2f to_device_ms=%.2f input_len=%s",
+        (t_tpl - t0) * 1000.0,
+        (t_to - t_tpl) * 1000.0,
+        input_len,
+    )
     gen_kwargs = _build_generation_kwargs(
         req.max_new_tokens,
         req.temperature,
@@ -2370,6 +2506,7 @@ async def audio_chat_stream(
             ],
         }
     ]
+    t0 = time.perf_counter()
     tpl_kw: dict[str, Any] = {
         "tokenize": True,
         "return_dict": True,
@@ -2393,7 +2530,19 @@ async def audio_chat_stream(
             ),
         )
 
+    t_tpl = time.perf_counter()
     inputs = inputs.to(_inference_device())
+    t_to = time.perf_counter()
+    try:
+        input_len = int(inputs["input_ids"].shape[-1])
+    except Exception:
+        input_len = -1
+    _perf(
+        "audio_stream_prepare template_ms=%.2f to_device_ms=%.2f input_len=%s",
+        (t_tpl - t0) * 1000.0,
+        (t_to - t_tpl) * 1000.0,
+        input_len,
+    )
     gen_kwargs = _build_generation_kwargs(
         req.max_new_tokens,
         req.temperature,

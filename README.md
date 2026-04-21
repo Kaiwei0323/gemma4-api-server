@@ -39,6 +39,13 @@ copy .env.example .env
   - `cuda0` = force all weights on GPU 0 (may OOM)
   - `auto` = Allow distribution across both GPUs
 - **`GEMMA_API_KEY`** (optional): if set, requests must include `X-API-Key: ...`
+- **Performance tuning (optional)**:
+  - **`GEMMA_ENABLE_TF32`**: `1` (default) enables TF32 on CUDA for faster matmuls on modern GPUs (minor numeric differences vs full FP32).
+  - **`GEMMA_ENABLE_SDPA`**: `1` (default) enables PyTorch scaled-dot-product attention fast paths when available.
+  - **`GEMMA_DISABLE_MATH_SDPA`**: `0` (default). Set to `1` only if you know your model shape supports fused SDPA kernels. If set incorrectly, you may get `RuntimeError: No available kernel`.
+  - **`GEMMA_USE_AUTOCAST`**: `1` (default) enables CUDA autocast during generation to use bf16/fp16 kernels.
+  - **`GEMMA_AUTOCAST_DTYPE`**: `bf16` (default) or `fp16`.
+  - **`GEMMA_PERF_LOG`**: `0` (default). Set to `1` to log per-endpoint timing breakdowns (prompt/template time, tokenize time, device transfer, and streaming TTFT).
 
 ## Build & run (Docker)
 
