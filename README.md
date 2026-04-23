@@ -2,19 +2,22 @@
 
 Local HTTP API for Gemma 4, implemented in `api_server.py` and designed to load a **local** model directory (no Hub download).
 
+### Serving backends
+
+| Mode | When to use | Docker |
+|------|-------------|--------|
+| **`GEMMA_API_BACKEND=vllm`** (default in `Dockerfile`) | Fast **`/chat/stream`**, **`/image/stream`**, **`/video/stream`** via vLLM `AsyncLLM` (tensor parallel, Gemma 4–optimized image) | `FROM vllm/vllm-openai:gemma4-cu130` |
+| **`GEMMA_API_BACKEND=hf`** | **`transformers`** stack for **`/chat/stream`**, **`/image/stream`**, **`/video/stream`** (SSE) | `Dockerfile.pytorch-hf` |
+
+With **`GEMMA_SKIP_HF_MODEL=1`** (default in the vLLM `Dockerfile`), the Hugging Face model is **not** loaded, so **`/image/stream`** and **`/video/stream`** need the HF stack unless you set **`GEMMA_SKIP_HF_MODEL=0`** (loads both engines; needs enough VRAM). **`/chat/stream`** uses vLLM when it is loaded.
+
 ### Endpoints
 
-- **`POST /chat`**: text → text (JSON or `multipart/form-data`)
-- **`POST /chat/stream`**: text → text (**streaming tokens** via SSE over HTTP)
-- **`POST /image`**: image + text → text (multimodal checkpoint required)
-- **`POST /image/stream`**: image + text → text (**streaming tokens** via SSE, multimodal required)
-- **`POST /video`**: video + text → text (multimodal checkpoint required)
-- **`POST /video/stream`**: video + text → text (**streaming tokens** via SSE, multimodal required)
-- **`POST /audio`**: audio + text → text (multimodal checkpoint required)
-- **`POST /audio/stream`**: audio + text → text (**streaming tokens** via SSE, multimodal + audio tower required)
+- **`POST /chat/stream`**: text → text (**SSE**; JSON or `multipart/form-data`)
+- **`POST /image/stream`**: image + text → text (**SSE**; multimodal checkpoint required)
+- **`POST /video/stream`**: video + text → text (**SSE**; multimodal checkpoint required)
 - **`GET /health`**: model/GPU status
-
-The **gemma-4-31B-it** checkpoint does not support audio (`POST /audio`).
+- **`GET /`**: short service metadata
 
 ## Prerequisites
 
@@ -39,7 +42,13 @@ copy .env.example .env
   - `cuda0` = force all weights on GPU 0 (may OOM)
   - `auto` = Allow distribution across both GPUs
 - **`GEMMA_API_KEY`** (optional): if set, requests must include `X-API-Key: ...`
-- **Performance tuning (optional)**:
+- **`GEMMA_DEFAULT_SYSTEM_PROMPT`** (optional): if set, prepended as the **first** `system` message on **every** **`/chat/stream`**, **`/image/stream`**, and **`/video/stream`** request (each POST), so the model always sees it for that call. Set **`GEMMA_DEFAULT_SYSTEM_RESPECT_CLIENT_SYSTEM=1`** to restore legacy behavior (do not prepend if the client already sent a `system` turn). **`GEMMA_DEFAULT_SYSTEM_FORCE_PREPEND=1`** forces prepend even when `RESPECT` is on.
+- **vLLM (when `GEMMA_API_BACKEND=vllm`)**:
+  - **`GEMMA_SKIP_HF_MODEL`**: `1` (default in vLLM image) skips loading the in-process HF model (saves VRAM).
+  - **`GEMMA_VLLM_TP_SIZE`**: tensor parallel size (default `2` for two GPUs; use `1` on a single GPU).
+  - **`GEMMA_VLLM_MAX_MODEL_LEN`**: context length cap (default `8192`).
+  - **`GEMMA_VLLM_GPU_MEMORY_UTILIZATION`**: fraction of GPU memory for vLLM (default `0.90`).
+- **Performance tuning (HF path only, optional)**:
   - **`GEMMA_ENABLE_TF32`**: `1` (default) enables TF32 on CUDA for faster matmuls on modern GPUs (minor numeric differences vs full FP32).
   - **`GEMMA_ENABLE_SDPA`**: `1` (default) enables PyTorch scaled-dot-product attention fast paths when available.
   - **`GEMMA_DISABLE_MATH_SDPA`**: `0` (default). Set to `1` only if you know your model shape supports fused SDPA kernels. If set incorrectly, you may get `RuntimeError: No available kernel`.
@@ -64,23 +73,9 @@ curl -s http://99.64.152.85:5000/health
 
 ## API examples
 
-### `POST /chat`
+These routes stream **incremental text** as Server-Sent Events (SSE). In the browser you usually consume them using `fetch()` + `ReadableStream` (not `EventSource`, because `EventSource` only supports GET).
 
-```bash
-curl -sS -X POST "http://99.64.152.85:5000/chat" \
-  -F "text=Reply with exactly three words." \
-  -F "max_new_tokens=64"
-```
-
-```bash
-curl -sS -X POST "http://99.64.152.85:5000/chat" \
-  -F 'messages=[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Reply with exactly three words."}]' \
-  -F "max_new_tokens=64"
-```
-
-### `POST /chat/stream` (stream tokens)
-
-This endpoint streams **incremental text** as Server-Sent Events (SSE). In the browser you usually consume it using `fetch()` + `ReadableStream` (not `EventSource`, because `EventSource` only supports GET).
+### `POST /chat/stream`
 
 ```bash
 curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
@@ -88,13 +83,13 @@ curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
   -d '{"messages":[{"role":"user","content":"Write a short poem about rain."}],"max_new_tokens":128}'
 ```
 
-### `POST /image`
-
 ```bash
-curl -sS -X POST "http://99.64.152.85:5000/image"   -F "text=Describe this."   -F "image_file=@images/eiffel_tower.jpg"   -F "max_new_tokens=128"
+curl -N -X POST "http://99.64.152.85:5000/chat/stream" \
+  -F "text=Reply with exactly three words." \
+  -F "max_new_tokens=64"
 ```
 
-### `POST /image/stream` (stream tokens)
+### `POST /image/stream`
 
 ```cmd
 curl -N -X POST "http://99.64.152.85:5000/image/stream" ^
@@ -103,38 +98,11 @@ curl -N -X POST "http://99.64.152.85:5000/image/stream" ^
   -F "max_new_tokens=128"
 ```
 
-### `POST /video`
-
-```bash
-curl -sS -X POST "http://99.64.152.85:5000/video" \
-  -F "text=Describe this video." \
-  -F "video_url=@videos/ForBiggerBlazes.mp4" \
-  -F "max_new_tokens=256"
-```
-
-### `POST /video/stream` (stream tokens)
+### `POST /video/stream`
 
 ```cmd
 curl -N -X POST "http://99.64.152.85:5000/video/stream" ^
   -F "text=Describe this video." ^
   -F "video_url=@videos/ForBiggerBlazes.mp4" ^
-  -F "max_new_tokens=256"
-```
-
-### `POST /audio`
-
-```bash
-curl -sS -X POST "http://99.64.152.85:5000/audio" \
-  -F "text=Transcribe the following speech segment in its original language. Only output the transcription, with no newlines." \
-  -F "audio_url=@audios/Demos_sample-data_journal1.wav" \
-  -F "max_new_tokens=256"
-```
-
-### `POST /audio/stream` (stream tokens)
-
-```cmd
-curl -N -X POST "http://99.64.152.85:5000/audio/stream" ^
-  -F "text=Transcribe. Only output the transcription." ^
-  -F "audio_url=@audios/Demos_sample-data_journal1.wav" ^
   -F "max_new_tokens=256"
 ```

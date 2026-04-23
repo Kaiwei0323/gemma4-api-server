@@ -1,5 +1,5 @@
 """
-HTTP API for local Gemma 4: text chat (`/chat`) and image+text (`/image` JSON or multipart, multimodal checkpoint).
+HTTP API for local Gemma 4: streaming only — `POST /chat/stream`, `POST /image/stream`, `POST /video/stream` (SSE).
 
 Run (recommended: project venv avoids C:\\Python311 permission errors):
   python -m venv .venv
@@ -48,12 +48,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from gemma_prompts import (
+    default_system_prompt_text,
+    default_system_prompt_would_prepend,
+    prepend_default_system,
+)
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +185,20 @@ def _truthy_env(key: str, default: bool) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _api_backend() -> str:
+    """`hf` = Hugging Face `transformers` in-process (default). `vllm` = vLLM AsyncLLM for stream routes."""
+    return os.environ.get("GEMMA_API_BACKEND", "hf").strip().lower()
+
+
+def _vllm_ready() -> bool:
+    try:
+        import gemma_vllm as gv
+
+        return gv.is_loaded()
+    except Exception:
+        return False
 
 
 def _apply_transformers_runtime_patches() -> None:
@@ -652,121 +671,6 @@ async def _video_request_from_multipart(request: Request) -> tuple[VideoRequest,
     return req, None
 
 
-async def _audio_request_from_multipart(request: Request) -> tuple[AudioRequest, Path | None]:
-    form = await request.form()
-
-    text = (form.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing form field: text")
-
-    audio_url: str | None = None
-    chosen_upload: Any | None = None
-
-    audio_url_field = form.get("audio_url")
-    if _is_starlette_upload_file(audio_url_field):
-        chosen_upload = audio_url_field
-    elif audio_url_field is None:
-        audio_url = None
-    else:
-        audio_url = str(audio_url_field).strip() or None
-        if audio_url and audio_url.startswith("UploadFile("):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Malformed multipart request: `audio_url` was not parsed as a file upload. "
-                    "Use: -F \"audio_url=@your.wav\" (note the '@'), or use -F \"audio_file=@your.wav\"."
-                ),
-            )
-
-    audio_file_field = form.get("audio_file")
-    if chosen_upload is None and _is_starlette_upload_file(audio_file_field):
-        chosen_upload = audio_file_field
-    elif chosen_upload is None and audio_file_field is not None and not _is_starlette_upload_file(audio_file_field):
-        raise HTTPException(
-            status_code=400,
-            detail="`audio_file` must be a file upload (use -F \"audio_file=@clip.wav\").",
-        )
-
-    uploads: list[Any] = []
-    for _, v in form.multi_items():
-        if _is_starlette_upload_file(v):
-            uploads.append(v)
-
-    if chosen_upload is None:
-        if len(uploads) == 1:
-            chosen_upload = uploads[0]
-        elif len(uploads) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Multiple file parts were uploaded; specify `audio_url=@...` or `audio_file=@...`.",
-            )
-
-    tmp_path: Path | None = None
-    uploaded_abs_path: str | None = None
-    if chosen_upload is not None:
-        if audio_url:
-            raise HTTPException(status_code=400, detail="Provide only one of: audio_url (string) or an audio file upload.")
-
-        up = chosen_upload
-        raw_name = (up.filename or "upload").strip() or "upload"
-        safe_name = Path(raw_name).name
-        suffix = Path(safe_name).suffix.lower()
-        allowed = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac"}
-        if suffix and suffix not in allowed:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported uploaded audio extension {suffix!r}. Allowed: {sorted(allowed)}",
-            )
-
-        data = await up.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
-
-        uploads_dir = _default_upload_tmp_dir()
-        tmp_path = uploads_dir / f"{uuid.uuid4().hex}{suffix or '.wav'}"
-        tmp_path.write_bytes(data)
-        uploaded_abs_path = str(tmp_path.resolve())
-
-    enable_thinking = _truthy_form_value(form.get("enable_thinking"))  # type: ignore[arg-type]
-    do_sample = _truthy_form_value(form.get("do_sample"))  # type: ignore[arg-type]
-    include_raw = _truthy_form_value(form.get("include_raw"))  # type: ignore[arg-type]
-
-    if uploaded_abs_path is not None:
-        req = AudioRequest(
-            audio_url=None,
-            audio_upload_path=uploaded_abs_path,
-            text=text,
-            enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
-            max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
-            temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
-            top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
-            top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
-            do_sample=do_sample,
-            include_raw=bool(include_raw) if include_raw is not None else False,
-        )
-        return req, tmp_path
-
-    if not audio_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing audio input: provide `audio_url` as http(s) string, or upload a file via `audio_url=@...`.",
-        )
-
-    req = AudioRequest(
-        audio_url=audio_url,
-        audio_upload_path=None,
-        text=text,
-        enable_thinking=bool(enable_thinking) if enable_thinking is not None else False,
-        max_new_tokens=_parse_optional_int(form.get("max_new_tokens")) or 512,  # type: ignore[arg-type]
-        temperature=_parse_optional_float(form.get("temperature")),  # type: ignore[arg-type]
-        top_p=_parse_optional_float(form.get("top_p")),  # type: ignore[arg-type]
-        top_k=_parse_optional_int(form.get("top_k")),  # type: ignore[arg-type]
-        do_sample=do_sample,
-        include_raw=bool(include_raw) if include_raw is not None else False,
-    )
-    return req, None
-
-
 async def _chat_request_from_multipart(request: Request) -> ChatRequest:
     form = await request.form()
 
@@ -775,7 +679,7 @@ async def _chat_request_from_multipart(request: Request) -> ChatRequest:
         if _is_starlette_upload_file(v):
             raise HTTPException(
                 status_code=400,
-                detail="Multipart /chat does not accept file uploads. Put JSON in `messages` or use field `text`.",
+                detail="Multipart /chat/stream does not accept file uploads. Put JSON in `messages` or use field `text`.",
             )
 
     messages_raw = form.get("messages")
@@ -1047,16 +951,15 @@ def _load_model() -> None:
     _load_error = None
     _model_supports_audio = getattr(_model.config, "audio_config", None) is not None
     log.info(
-        "Model load: audio_config %s — POST /audio %s",
+        "Model load: audio_config %s",
         "present" if _model_supports_audio else "absent (null)",
-        "available" if _model_supports_audio else "disabled for this checkpoint",
     )
     _startup_echo(
         f"stage=model_load_complete total_s={time.perf_counter() - t0:.1f} model_kind={_model_kind!r} "
         f"audio={_model_supports_audio!r} — HTTP API ready"
     )
     log.info(
-        "Model load: complete in %.1fs — ready for /chat (%s)",
+        "Model load: complete in %.1fs — ready for stream routes (%s)",
         time.perf_counter() - t0,
         _model_kind,
     )
@@ -1074,14 +977,41 @@ async def lifespan(_app: FastAPI):
         threading.main_thread().name,
         os.getcwd(),
     )
-    _load_model()
+    if _api_backend() == "vllm":
+        try:
+            import gemma_vllm as gv
+
+            gv.load_vllm_backend()
+            if gv.load_error():
+                _startup_echo(f"stage=vllm_load_failed error={gv.load_error()!r}")
+                log.warning("vLLM backend failed to load: %s", gv.load_error())
+            else:
+                _startup_echo("stage=vllm_load_ok")
+        except Exception as e:
+            _startup_echo(f"stage=vllm_load_exception error={e!r}")
+            log.exception("vLLM backend load raised")
+
+    if not _truthy_env("GEMMA_SKIP_HF_MODEL", False):
+        _load_model()
     if _load_error:
         _startup_echo(f"stage=lifespan_model_failed error={_load_error!r}")
         log.warning("Startup finished with model error (service degraded): %s", _load_error)
     else:
-        _startup_echo("stage=lifespan_model_ok — uvicorn will print 'Application startup complete'")
+        if not _truthy_env("GEMMA_SKIP_HF_MODEL", False):
+            _startup_echo("stage=lifespan_model_ok — uvicorn will print 'Application startup complete'")
+        elif _vllm_ready():
+            _startup_echo("stage=hf_model_skipped_vllm_ok — uvicorn will print 'Application startup complete'")
+        else:
+            _startup_echo("stage=hf_model_skipped")
         log.info("Startup: application ready (uvicorn will log 'Application startup complete')")
     yield
+    try:
+        if _api_backend() == "vllm":
+            import gemma_vllm as gv
+
+            gv.shutdown_vllm()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Gemma 4 local chat API", lifespan=lifespan)
@@ -1127,68 +1057,6 @@ class ChatRequest(BaseModel):
     top_k: int | None = Field(None, ge=1)
     do_sample: bool | None = None
     include_raw: bool = Field(False, description="If true, include raw decoded assistant string")
-
-
-class ChatResponse(BaseModel):
-    parsed: Any
-    raw: str | None = None
-    model_path: str | None = None
-    time_to_first_token_seconds: float | None = Field(
-        default=None,
-        description=(
-            "Wall seconds from the start of model.generate() until the first decoding step that produces "
-            "the first new output token (TTFT). Excludes request parsing and input preprocessing before generate()."
-        ),
-    )
-    tokens_per_second: float | None = Field(
-        default=None,
-        description="New tokens per second during model.generate() only (output length − prompt length, wall clock).",
-    )
-
-
-def _new_token_count_and_tps(outputs: Any, input_len: int, elapsed_s: float) -> tuple[int, float | None]:
-    n_new = max(0, int(outputs[0].shape[-1]) - int(input_len))
-    if elapsed_s <= 1e-9:
-        return n_new, None
-    return n_new, round(n_new / elapsed_s, 3)
-
-
-def _generate_with_ttft(inputs: Any, gen_kwargs: dict[str, Any]) -> tuple[Any, float | None, float]:
-    """Run `_model.generate` under `_gen_lock` and measure TTFT + total generate wall time.
-
-    TTFT is the wall time from immediately before `generate()` until the first `LogitsProcessor` call,
-    which aligns with the first step that produces logits for the first new token.
-    """
-    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
-
-    class _TtftLogitsProcessor(LogitsProcessor):
-        def __init__(self, t_start: float) -> None:
-            self._t0 = t_start
-            self.seconds: float | None = None
-
-        def __call__(self, input_ids: Any, scores: Any) -> Any:
-            if self.seconds is None:
-                self.seconds = time.perf_counter() - self._t0
-            return scores
-
-    t_gen0 = time.perf_counter()
-    hook = _TtftLogitsProcessor(t_gen0)
-    merged = dict(gen_kwargs)
-    existing_lp = merged.get("logits_processor")
-    if existing_lp is None:
-        merged["logits_processor"] = LogitsProcessorList([hook])
-    elif isinstance(existing_lp, LogitsProcessorList):
-        merged["logits_processor"] = LogitsProcessorList(list(existing_lp) + [hook])
-    else:
-        merged["logits_processor"] = LogitsProcessorList([existing_lp, hook])
-
-    assert _model is not None
-    with _gen_lock:
-        with _inference_context():
-            outputs = _model.generate(**inputs, **merged)
-    gen_elapsed = time.perf_counter() - t_gen0
-    ttft = round(hook.seconds, 4) if hook.seconds is not None else None
-    return outputs, ttft, gen_elapsed
 
 
 # Gemma 4 image/video processors only allow these soft-token budgets (see transformers Gemma4*Processor).
@@ -1362,33 +1230,6 @@ class VideoRequest(BaseModel):
         return self
 
 
-class AudioRequest(BaseModel):
-    audio_url: str | None = Field(
-        default=None,
-        description="HTTP(S) URL of the audio (wav/mp3/flac), OR use multipart upload fields instead.",
-    )
-    audio_upload_path: str | None = Field(
-        default=None,
-        description="Internal: absolute filesystem path to an uploaded audio staged under GEMMA_UPLOAD_TMP_DIR.",
-    )
-    text: str = Field(..., description="Question or instruction about the audio")
-    enable_thinking: bool = False
-    max_new_tokens: int = Field(512, ge=1, le=8192)
-    temperature: float | None = Field(None, ge=0, le=2)
-    top_p: float | None = Field(None, ge=0, le=1)
-    top_k: int | None = Field(None, ge=1)
-    do_sample: bool | None = None
-    include_raw: bool = False
-
-    @model_validator(mode="after")
-    def _validate_audio_sources(self) -> AudioRequest:
-        u = bool((self.audio_url or "").strip())
-        p = bool((self.audio_upload_path or "").strip())
-        if int(u) + int(p) != 1:
-            raise ValueError("Provide exactly one of: audio_url (remote) or a multipart file upload.")
-        return self
-
-
 def _inference_device() -> Any:
     assert _model is not None
     dev = getattr(_model, "device", None)
@@ -1490,60 +1331,12 @@ def _build_generation_kwargs(
     return gen_kwargs
 
 
-def _generate_sync(req: ChatRequest) -> ChatResponse:
-    assert _model is not None and _processor is not None
-
-    messages = [m.model_dump() for m in req.messages]
-
-    text = _processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=req.enable_thinking,
-    )
-    inputs = _processor(text=text, return_tensors="pt").to(_inference_device())
-    input_len = inputs["input_ids"].shape[-1]
-
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    log.info(
-        "Chat: generate max_new_tokens=%s do_sample=%s input_len=%s",
-        req.max_new_tokens,
-        gen_kwargs["do_sample"],
-        input_len,
-    )
-    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
-    _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info(
-        "Chat: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
-        gen_elapsed,
-        ttft,
-        tps,
-    )
-
-    response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
-    parsed = _processor.parse_response(response)
-
-    return ChatResponse(
-        parsed=parsed,
-        raw=response if req.include_raw else None,
-        model_path=str(_model_path) if _model_path else None,
-        time_to_first_token_seconds=ttft,
-        tokens_per_second=tps,
-    )
-
-
 def _generate_stream_sse_from_inputs(
     *,
     inputs: Any,
     gen_kwargs: dict[str, Any],
     include_raw: bool,
+    meta_extra: dict[str, Any] | None = None,
 ):
     """
     Shared SSE streamer for any already-prepared `inputs` compatible with `_model.generate(**inputs, ...)`.
@@ -1605,7 +1398,10 @@ def _generate_stream_sse_from_inputs(
         merged.get("do_sample"),
     )
 
-    yield "event: meta\ndata: " + json.dumps({"model_path": str(_model_path) if _model_path else None}) + "\n\n"
+    meta: dict[str, Any] = {"model_path": str(_model_path) if _model_path else None, "backend": "hf"}
+    if meta_extra:
+        meta.update(meta_extra)
+    yield "event: meta\ndata: " + json.dumps(meta) + "\n\n"
 
     raw_parts: list[str] = []
     ttft: float | None = None
@@ -1667,7 +1463,9 @@ def _chat_stream_sse_events(req: ChatRequest):
     assert _model is not None and _processor is not None
 
     t0 = time.perf_counter()
-    messages = [m.model_dump() for m in req.messages]
+    raw_messages = [m.model_dump() for m in req.messages]
+    default_system_applied = default_system_prompt_would_prepend(raw_messages)
+    messages = prepend_default_system(raw_messages, multimodal=False)
     prompt = _processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -1702,6 +1500,7 @@ def _chat_stream_sse_events(req: ChatRequest):
         inputs=inputs,
         gen_kwargs=gen_kwargs,
         include_raw=req.include_raw,
+        meta_extra={"default_system_prompt_applied": default_system_applied},
     )
 
 
@@ -1744,272 +1543,10 @@ def _image_content_block(req: ImageRequest) -> dict[str, str]:
     return {"type": "image", "path": str(path)}
 
 
-def _image_generate_sync(req: ImageRequest, image_block: dict[str, str]) -> ChatResponse:
-    assert _model is not None and _processor is not None
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                image_block,
-                {"type": "text", "text": req.text},
-            ],
-        }
-    ]
-    tpl_kw: dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-    }
-    mm_pk = _processor_kwargs_for_image(req)
-    try:
-        if mm_pk:
-            inputs = _processor.apply_chat_template(
-                messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
-            )
-        else:
-            inputs = _processor.apply_chat_template(
-                messages, **tpl_kw, enable_thinking=req.enable_thinking
-            )
-    except TypeError:
-        if mm_pk:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
-        else:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw)
-
-    inputs = inputs.to(_inference_device())
-    input_len = inputs["input_ids"].shape[-1]
-
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    src = image_block.get("path") or image_block.get("url", "")
-    log.info(
-        "Image: generate src=%s max_new_tokens=%s do_sample=%s input_len=%s",
-        src[:120] + ("..." if len(src) > 120 else ""),
-        req.max_new_tokens,
-        gen_kwargs["do_sample"],
-        input_len,
-    )
-    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
-    _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info(
-        "Image: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
-        gen_elapsed,
-        ttft,
-        tps,
-    )
-
-    response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
-    parsed = _processor.parse_response(response)
-
-    return ChatResponse(
-        parsed=parsed,
-        raw=response if req.include_raw else None,
-        model_path=str(_model_path) if _model_path else None,
-        time_to_first_token_seconds=ttft,
-        tokens_per_second=tps,
-    )
-
-
-def _video_generate_sync(req: VideoRequest) -> ChatResponse:
-    assert _model is not None and _processor is not None
-
-    upload_path = (req.video_upload_path or "").strip()
-    video_url = (req.video_url or "").strip()
-
-    if upload_path:
-        p = Path(upload_path).expanduser().resolve()
-        if not p.is_file():
-            raise HTTPException(status_code=404, detail=f"Uploaded video not found: {p}")
-        video_ref = str(p)
-    else:
-        if not video_url:
-            raise HTTPException(status_code=400, detail="video_url is required")
-        _validate_remote_media_url(video_url, kind="video")
-        video_ref = video_url
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video", "video": video_ref},
-                {"type": "text", "text": req.text},
-            ],
-        }
-    ]
-    tpl_kw: dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-    }
-    mm_pk = _processor_kwargs_for_video(req)
-    try:
-        try:
-            if mm_pk:
-                inputs = _processor.apply_chat_template(
-                    messages, **tpl_kw, enable_thinking=req.enable_thinking, processor_kwargs=mm_pk
-                )
-            else:
-                inputs = _processor.apply_chat_template(
-                    messages, **tpl_kw, enable_thinking=req.enable_thinking
-                )
-        except TypeError:
-            if mm_pk:
-                inputs = _processor.apply_chat_template(messages, **tpl_kw, processor_kwargs=mm_pk)
-            else:
-                inputs = _processor.apply_chat_template(messages, **tpl_kw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Video: processor/apply_chat_template failed")
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Failed to fetch/process video input inside the server. "
-                f"{e.__class__.__name__}: {e}"
-            ),
-        )
-
-    inputs = inputs.to(_inference_device())
-    input_len = inputs["input_ids"].shape[-1]
-
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    log.info(
-        "Video: generate src=%s max_new_tokens=%s do_sample=%s input_len=%s",
-        video_ref[:120] + ("..." if len(video_ref) > 120 else ""),
-        req.max_new_tokens,
-        gen_kwargs["do_sample"],
-        input_len,
-    )
-    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
-    _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info(
-        "Video: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
-        gen_elapsed,
-        ttft,
-        tps,
-    )
-
-    response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
-    parsed = _processor.parse_response(response)
-
-    return ChatResponse(
-        parsed=parsed,
-        raw=response if req.include_raw else None,
-        model_path=str(_model_path) if _model_path else None,
-        time_to_first_token_seconds=ttft,
-        tokens_per_second=tps,
-    )
-
-
-def _audio_generate_sync(req: AudioRequest) -> ChatResponse:
-    assert _model is not None and _processor is not None
-
-    upload_path = (req.audio_upload_path or "").strip()
-    audio_url = (req.audio_url or "").strip()
-
-    if upload_path:
-        p = Path(upload_path).expanduser().resolve()
-        if not p.is_file():
-            raise HTTPException(status_code=404, detail=f"Uploaded audio not found: {p}")
-        audio_ref = str(p)
-    else:
-        if not audio_url:
-            raise HTTPException(status_code=400, detail="audio_url is required")
-        _validate_remote_media_url(audio_url, kind="audio")
-        audio_ref = audio_url
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": audio_ref},
-                {"type": "text", "text": req.text},
-            ],
-        }
-    ]
-    tpl_kw: dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-    }
-    try:
-        try:
-            inputs = _processor.apply_chat_template(
-                messages, **tpl_kw, enable_thinking=req.enable_thinking
-            )
-        except TypeError:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Audio: processor/apply_chat_template failed")
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Failed to fetch/process audio input inside the server. "
-                f"{e.__class__.__name__}: {e}"
-            ),
-        )
-
-    inputs = inputs.to(_inference_device())
-    input_len = inputs["input_ids"].shape[-1]
-
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    log.info(
-        "Audio: generate src=%s max_new_tokens=%s do_sample=%s input_len=%s",
-        audio_ref[:120] + ("..." if len(audio_ref) > 120 else ""),
-        req.max_new_tokens,
-        gen_kwargs["do_sample"],
-        input_len,
-    )
-    outputs, ttft, gen_elapsed = _generate_with_ttft(inputs, gen_kwargs)
-    _, tps = _new_token_count_and_tps(outputs, input_len, gen_elapsed)
-    log.info(
-        "Audio: generate wall=%.3fs time_to_first_token_s=%s tokens_per_second=%s",
-        gen_elapsed,
-        ttft,
-        tps,
-    )
-
-    response = _processor.decode(outputs[0][input_len:], skip_special_tokens=False)
-    parsed = _processor.parse_response(response)
-
-    return ChatResponse(
-        parsed=parsed,
-        raw=response if req.include_raw else None,
-        model_path=str(_model_path) if _model_path else None,
-        time_to_first_token_seconds=ttft,
-        tokens_per_second=tps,
-    )
-
-
 @app.get("/health")
 def health():
-    ok = _model is not None and _processor is not None
+    vllm_ok = _vllm_ready()
+    ok = (_model is not None and _processor is not None) or vllm_ok
     gpu_block: dict[str, Any] = {"require_gpu": _truthy_env("GEMMA_REQUIRE_GPU", True)}
     try:
         import torch
@@ -2024,16 +1561,30 @@ def health():
             gpu_block["param_devices"] = devices
     except Exception as e:
         gpu_block["error"] = str(e)
+    vllm_detail: dict[str, Any] = {"backend": _api_backend()}
+    try:
+        import gemma_vllm as gv
+
+        vllm_detail["vllm_loaded"] = gv.is_loaded()
+        if gv.load_error():
+            vllm_detail["vllm_error"] = gv.load_error()
+        if gv.model_path_str():
+            vllm_detail["vllm_model_path"] = gv.model_path_str()
+    except Exception as e:
+        vllm_detail["vllm_import_error"] = str(e)
+
     return {
         "status": "ok" if ok else "degraded",
         "model_loaded": ok,
         "model_kind": _model_kind,
-        "image_endpoint": ok and _model_kind == "multimodal",
+        "image_endpoint": ok and (_model_kind == "multimodal" or vllm_ok),
         "audio_supported": bool(ok and _model_supports_audio),
         "images_dir": str(_default_images_dir()),
         "gpu": gpu_block,
         "error": _load_error,
         "model_path": str(_model_path) if _model_path else None,
+        "vllm": vllm_detail,
+        "default_system_prompt_configured": bool(default_system_prompt_text()),
         "offload_hints": {
             "GEMMA_DEVICE_MAP": os.environ.get("GEMMA_DEVICE_MAP", "auto"),
             "GEMMA_MAX_MEMORY_GPU": os.environ.get("GEMMA_MAX_MEMORY_GPU", ""),
@@ -2047,36 +1598,11 @@ def health():
     }
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(
-    request: Request,
-    _: None = Depends(require_api_key),
-):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-
-    ct = (request.headers.get("content-type") or "").lower()
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
-    if is_multipart:
-        req = await _chat_request_from_multipart(request)
-    else:
-        req = _parse_json_model(ChatRequest, body, route="POST /chat")  # type: ignore[assignment]
-
-    return await anyio.to_thread.run_sync(lambda: _generate_sync(req))
-
-
 @app.post("/chat/stream")
 async def chat_stream(
     request: Request,
     _: None = Depends(require_api_key),
 ):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-
     ct = (request.headers.get("content-type") or "").lower()
     body = await request.body()
     if not body:
@@ -2087,6 +1613,35 @@ async def chat_stream(
         req = await _chat_request_from_multipart(request)
     else:
         req = _parse_json_model(ChatRequest, body, route="POST /chat/stream")  # type: ignore[assignment]
+
+    if _vllm_ready():
+        import gemma_vllm as gv
+
+        async def _vllm_chat_sse():
+            async for chunk in gv.sse_chat_stream(
+                messages=[m.model_dump() for m in req.messages],
+                enable_thinking=req.enable_thinking,
+                max_new_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                do_sample=req.do_sample,
+                include_raw=req.include_raw,
+            ):
+                yield chunk
+
+        return StreamingResponse(
+            _vllm_chat_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
 
     return StreamingResponse(
         _chat_stream_sse_events(req),
@@ -2100,64 +1655,11 @@ async def chat_stream(
     )
 
 
-@app.post("/image", response_model=ChatResponse)
-async def image_chat(
-    request: Request,
-    _: None = Depends(require_api_key),
-):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Image input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-
-    ct = (request.headers.get("content-type") or "").lower()
-    tmp_path: Path | None = None
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
-    if is_multipart:
-        req, tmp_path, _ = await _image_request_from_multipart(request)
-    else:
-        # IMPORTANT: do not declare `ImageRequest` as a FastAPI parameter here.
-        # For multipart uploads, FastAPI may try to treat file bytes as JSON and crash while encoding errors.
-        req = _parse_json_model(ImageRequest, body, route="POST /image")  # type: ignore[assignment]
-
-    assert req is not None
-    image_block = _image_content_block(req)
-    try:
-        return await anyio.to_thread.run_sync(lambda: _image_generate_sync(req, image_block))
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                log.warning("Image: could not delete temp upload: %s", tmp_path)
-
-
 @app.post("/image/stream")
 async def image_chat_stream(
     request: Request,
     _: None = Depends(require_api_key),
 ):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Image input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-
     ct = (request.headers.get("content-type") or "").lower()
     tmp_path: Path | None = None
     body = await request.body()
@@ -2172,9 +1674,55 @@ async def image_chat_stream(
 
     assert req is not None
     image_block = _image_content_block(req)
+    if _vllm_ready():
+        import gemma_vllm as gv
+
+        async def _vllm_image_sse():
+            try:
+                async for chunk in gv.sse_image_stream(
+                    image_block=image_block,
+                    text=req.text,
+                    enable_thinking=req.enable_thinking,
+                    image_max_soft_tokens=req.image_max_soft_tokens,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    do_sample=req.do_sample,
+                    include_raw=req.include_raw,
+                ):
+                    yield chunk
+            finally:
+                if tmp_path is not None:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        log.warning("Image(stream): could not delete temp upload: %s", tmp_path)
+
+        return StreamingResponse(
+            _vllm_image_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
+        if _model is None or _processor is None:
+            raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+        if _model_kind != "multimodal":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Image input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
+                    f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+                ),
+            )
+
         t0 = time.perf_counter()
-        messages = [
+        base_messages = [
             {
                 "role": "user",
                 "content": [
@@ -2183,6 +1731,8 @@ async def image_chat_stream(
                 ],
             }
         ]
+        default_system_applied = default_system_prompt_would_prepend(base_messages)
+        messages = prepend_default_system(base_messages, multimodal=True)
         tpl_kw: dict[str, Any] = {
             "tokenize": True,
             "return_dict": True,
@@ -2225,7 +1775,12 @@ async def image_chat_stream(
         )
 
         return StreamingResponse(
-            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
+            _generate_stream_sse_from_inputs(
+                inputs=inputs,
+                gen_kwargs=gen_kwargs,
+                include_raw=req.include_raw,
+                meta_extra={"default_system_prompt_applied": default_system_applied},
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2241,60 +1796,11 @@ async def image_chat_stream(
                 log.warning("Image(stream): could not delete temp upload: %s", tmp_path)
 
 
-@app.post("/video", response_model=ChatResponse)
-async def video_chat(
-    request: Request,
-    _: None = Depends(require_api_key),
-):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Video input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-
-    ct = (request.headers.get("content-type") or "").lower()
-    tmp_path: Path | None = None
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
-    if is_multipart:
-        req, tmp_path = await _video_request_from_multipart(request)
-    else:
-        req = _parse_json_model(VideoRequest, body, route="POST /video")  # type: ignore[assignment]
-
-    try:
-        return await anyio.to_thread.run_sync(lambda: _video_generate_sync(req))
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                log.warning("Video: could not delete temp upload: %s", tmp_path)
-
-
 @app.post("/video/stream")
 async def video_chat_stream(
     request: Request,
     _: None = Depends(require_api_key),
 ):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Video input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-
     ct = (request.headers.get("content-type") or "").lower()
     tmp_path: Path | None = None
     body = await request.body()
@@ -2320,7 +1826,52 @@ async def video_chat_stream(
         _validate_remote_media_url(video_url, kind="video")
         video_ref = video_url
 
-    messages = [
+    if _vllm_ready():
+        import gemma_vllm as gv
+
+        async def _vllm_video_sse():
+            try:
+                async for chunk in gv.sse_video_stream(
+                    video_ref=video_ref,
+                    text=req.text,
+                    enable_thinking=req.enable_thinking,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    do_sample=req.do_sample,
+                    include_raw=req.include_raw,
+                ):
+                    yield chunk
+            finally:
+                if tmp_path is not None:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        log.warning("Video(stream): could not delete temp upload: %s", tmp_path)
+
+        return StreamingResponse(
+            _vllm_video_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if _model is None or _processor is None:
+        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
+    if _model_kind != "multimodal":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Video input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
+                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
+            ),
+        )
+
+    base_messages = [
         {
             "role": "user",
             "content": [
@@ -2329,6 +1880,8 @@ async def video_chat_stream(
             ],
         }
     ]
+    default_system_applied = default_system_prompt_would_prepend(base_messages)
+    messages = prepend_default_system(base_messages, multimodal=True)
     t0 = time.perf_counter()
     tpl_kw: dict[str, Any] = {
         "tokenize": True,
@@ -2385,7 +1938,12 @@ async def video_chat_stream(
 
     try:
         return StreamingResponse(
-            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
+            _generate_stream_sse_from_inputs(
+                inputs=inputs,
+                gen_kwargs=gen_kwargs,
+                include_raw=req.include_raw,
+                meta_extra={"default_system_prompt_applied": default_system_applied},
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2401,183 +1959,14 @@ async def video_chat_stream(
                 log.warning("Video(stream): could not delete temp upload: %s", tmp_path)
 
 
-@app.post("/audio", response_model=ChatResponse)
-async def audio_chat(
-    request: Request,
-    _: None = Depends(require_api_key),
-):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Audio input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-    if not _model_supports_audio:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "This checkpoint has no audio encoder (`audio_config` is null in config.json). "
-                "POST /audio requires a Gemma 4 release that ships audio tower weights; "
-                "your current model can still use /chat, /image, and /video if supported."
-            ),
-        )
-
-    ct = (request.headers.get("content-type") or "").lower()
-    tmp_path: Path | None = None
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
-    if is_multipart:
-        req, tmp_path = await _audio_request_from_multipart(request)
-    else:
-        req = _parse_json_model(AudioRequest, body, route="POST /audio")  # type: ignore[assignment]
-
-    try:
-        return await anyio.to_thread.run_sync(lambda: _audio_generate_sync(req))
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                log.warning("Audio: could not delete temp upload: %s", tmp_path)
-
-
-@app.post("/audio/stream")
-async def audio_chat_stream(
-    request: Request,
-    _: None = Depends(require_api_key),
-):
-    if _model is None or _processor is None:
-        raise HTTPException(status_code=503, detail=_load_error or "Model not loaded")
-    if _model_kind != "multimodal":
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Audio input requires a multimodal checkpoint loaded as AutoModelForMultimodalLM. "
-                f"This instance loaded as {_model_kind!r}. Use a Gemma 4 multimodal model folder or check logs."
-            ),
-        )
-    if not _model_supports_audio:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "This checkpoint has no audio encoder (`audio_config` is null in config.json). "
-                "POST /audio/stream requires a Gemma 4 release that ships audio tower weights."
-            ),
-        )
-
-    ct = (request.headers.get("content-type") or "").lower()
-    tmp_path: Path | None = None
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    is_multipart = ("multipart/form-data" in ct) or ("boundary=" in ct) or _body_looks_like_multipart(body)
-    if is_multipart:
-        req, tmp_path = await _audio_request_from_multipart(request)
-    else:
-        req = _parse_json_model(AudioRequest, body, route="POST /audio/stream")  # type: ignore[assignment]
-
-    upload_path = (req.audio_upload_path or "").strip()
-    audio_url = (req.audio_url or "").strip()
-    if upload_path:
-        p = Path(upload_path).expanduser().resolve()
-        if not p.is_file():
-            raise HTTPException(status_code=404, detail=f"Uploaded audio not found: {p}")
-        audio_ref = str(p)
-    else:
-        if not audio_url:
-            raise HTTPException(status_code=400, detail="audio_url is required")
-        _validate_remote_media_url(audio_url, kind="audio")
-        audio_ref = audio_url
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": audio_ref},
-                {"type": "text", "text": req.text},
-            ],
-        }
-    ]
-    t0 = time.perf_counter()
-    tpl_kw: dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-    }
-    try:
-        try:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw, enable_thinking=req.enable_thinking)
-        except TypeError:
-            inputs = _processor.apply_chat_template(messages, **tpl_kw)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Audio(stream): processor/apply_chat_template failed")
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Failed to fetch/process audio input inside the server. "
-                f"{e.__class__.__name__}: {e}"
-            ),
-        )
-
-    t_tpl = time.perf_counter()
-    inputs = inputs.to(_inference_device())
-    t_to = time.perf_counter()
-    try:
-        input_len = int(inputs["input_ids"].shape[-1])
-    except Exception:
-        input_len = -1
-    _perf(
-        "audio_stream_prepare template_ms=%.2f to_device_ms=%.2f input_len=%s",
-        (t_tpl - t0) * 1000.0,
-        (t_to - t_tpl) * 1000.0,
-        input_len,
-    )
-    gen_kwargs = _build_generation_kwargs(
-        req.max_new_tokens,
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        req.do_sample,
-    )
-
-    try:
-        return StreamingResponse(
-            _generate_stream_sse_from_inputs(inputs=inputs, gen_kwargs=gen_kwargs, include_raw=req.include_raw),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                log.warning("Audio(stream): could not delete temp upload: %s", tmp_path)
-
-
 @app.get("/")
 def root():
     return {
         "service": "gemma-4-local-chat",
         "endpoints": {
-            "POST /chat": "text chat (JSON or multipart/form-data: text=... OR messages=<json>)",
-            "POST /image": "image (JSON or multipart/form-data: image_url | image_file | upload) + text — multimodal only",
-            "POST /video": "video (JSON video_url OR multipart upload: video_url=@file / video_file=@file) + text — multimodal only",
-            "POST /audio": "audio (JSON audio_url OR multipart upload: audio_url=@file / audio_file=@file) + text — multimodal only",
+            "POST /chat/stream": "text chat — SSE (JSON or multipart: text=... OR messages=<json>)",
+            "POST /image/stream": "image + text — SSE (JSON or multipart; multimodal required)",
+            "POST /video/stream": "video + text — SSE (JSON or multipart; multimodal required)",
             "GET /health": "load status",
         },
         "model_path_env": "GEMMA_MODEL_PATH (default: ./gemma-4-E4B-it next to api_server.py)",

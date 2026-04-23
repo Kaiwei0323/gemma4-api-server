@@ -1,21 +1,29 @@
-# CUDA + PyTorch runtime (GPU). Host needs NVIDIA Container Toolkit / Docker GPU support.
-# Model weights are NOT baked in: mount your checkpoint at /model (see docker-compose.yml).
-#
-# Force all weights on GPU 0 (OOM if checkpoint does not fit in VRAM at current dtype):
-#   GEMMA_DEVICE_MAP=cuda0 (set below)
-# If OOM: use GEMMA_DEVICE_MAP=auto or GEMMA_LOAD_4BIT=1 (see api_server.py).
+# Gemma 4 API with vLLM (AsyncLLM) for /chat/stream, /image/stream, /video/stream.
+# Base image provides CUDA 13.0 + vLLM tuned for Gemma 4.
+# Mount your full checkpoint at /model (see docker-compose.yml).
 
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+FROM vllm/vllm-openai:gemma4-cu130
+
+# Base image sets ENTRYPOINT to the `vllm` CLI; clear it so CMD runs Python/uvicorn.
+ENTRYPOINT []
+
+# Base image may not provide a `python` name on PATH (conda often has /opt/conda/bin/python only).
+RUN set -eux; \
+    if command -v python >/dev/null 2>&1; then exit 0; fi; \
+    if [ -x /opt/conda/bin/python ]; then ln -sf /opt/conda/bin/python /usr/local/bin/python; \
+    elif command -v python3 >/dev/null 2>&1; then ln -sf "$(command -v python3)" /usr/local/bin/python; \
+    else echo "ERROR: no python in image" >&2; exit 1; fi; \
+    command -v python
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    GEMMA_REQUIRE_GPU=1 \
-    GEMMA_DEVICE_MAP=cuda0 \
     GEMMA_MODEL_PATH=/model \
     GEMMA_IMAGES_DIR=/images \
-    GEMMA_WEIGHTS_TQDM=1 \
-    GEMMA_LOAD_HEARTBEAT=1 \
-    GEMMA_LOAD_HEARTBEAT_SEC=10
+    GEMMA_API_BACKEND=vllm \
+    GEMMA_SKIP_HF_MODEL=1 \
+    GEMMA_VLLM_TP_SIZE=2 \
+    GEMMA_VLLM_MAX_MODEL_LEN=8192 \
+    GEMMA_VLLM_GPU_MEMORY_UTILIZATION=0.90
 
 WORKDIR /app
 
@@ -23,10 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-docker.txt .
-RUN pip install --upgrade pip && pip install -r requirements-docker.txt
+COPY requirements-docker-vllm.txt .
+RUN pip install --upgrade pip && pip install -r requirements-docker-vllm.txt
 
-COPY api_server.py .
+COPY api_server.py gemma_vllm.py gemma_prompts.py .
 
 EXPOSE 5000
 

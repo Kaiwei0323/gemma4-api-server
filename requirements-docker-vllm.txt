@@ -1,0 +1,5 @@
+# Extra deps for FastAPI on top of vllm/vllm-openai:gemma4-cu130 (torch/vllm/transformers are in the image).
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart
+pydantic>=2.0

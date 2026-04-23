@@ -1,7 +1,9 @@
 # GPU: install NVIDIA Container Toolkit on Linux, or enable GPU in Docker Desktop (WSL2).
 # Build:  docker compose build
 # Run:    docker compose up
-# Model: bind-mount ./gemma-4-E4B-it to /model (full checkpoint with weights).
+# Model: bind-mount checkpoint to /model (full checkpoint with weights).
+#
+# Default Dockerfile uses vLLM for fast stream routes. For Hugging Face-only use Dockerfile.pytorch-hf.
 
 services:
   gemma-api:
@@ -10,11 +12,14 @@ services:
     ports:
       - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-5000}:${CONTAINER_PORT:-5000}"
     environment:
-      # Default `0` uses only the first GPU. For large models split across multiple GPUs (e.g. 31B on 2×L40S),
-      # set NVIDIA_VISIBLE_DEVICES=all (or `0,1`) in `.env` and use GEMMA_DEVICE_MAP=auto.
-      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-0}"
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
       NVIDIA_DRIVER_CAPABILITIES: "${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
-      # cuda0 = all weights on one GPU. For 31B+ on multi-GPU, use auto (see README).
+      GEMMA_API_BACKEND: "${GEMMA_API_BACKEND:-vllm}"
+      GEMMA_SKIP_HF_MODEL: "${GEMMA_SKIP_HF_MODEL:-1}"
+      GEMMA_VLLM_TP_SIZE: "${GEMMA_VLLM_TP_SIZE:-2}"
+      GEMMA_VLLM_MAX_MODEL_LEN: "${GEMMA_VLLM_MAX_MODEL_LEN:-8192}"
+      GEMMA_VLLM_GPU_MEMORY_UTILIZATION: "${GEMMA_VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+      GEMMA_VLLM_TRUST_REMOTE_CODE: "${GEMMA_VLLM_TRUST_REMOTE_CODE:-1}"
       GEMMA_REQUIRE_GPU: "${GEMMA_REQUIRE_GPU:-1}"
       GEMMA_DEVICE_MAP: "${GEMMA_DEVICE_MAP:-cuda0}"
       GEMMA_MAX_MEMORY_GPU: "${GEMMA_MAX_MEMORY_GPU:-}"
@@ -33,11 +38,14 @@ services:
       GEMMA_VIDEO_MAX_SOFT_TOKENS: "${GEMMA_VIDEO_MAX_SOFT_TOKENS:-}"
       GEMMA_IMAGE_MAX_SOFT_TOKENS: "${GEMMA_IMAGE_MAX_SOFT_TOKENS:-}"
       GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
+      GEMMA_DEFAULT_SYSTEM_PROMPT: "${GEMMA_DEFAULT_SYSTEM_PROMPT:-}"
+      GEMMA_DEFAULT_SYSTEM_FORCE_PREPEND: "${GEMMA_DEFAULT_SYSTEM_FORCE_PREPEND:-}"
+      GEMMA_DEFAULT_SYSTEM_RESPECT_CLIENT_SYSTEM: "${GEMMA_DEFAULT_SYSTEM_RESPECT_CLIENT_SYSTEM:-}"
       # If full fp/bf16 model OOMs on your GPU, comment cuda0 and use auto + 4-bit instead:
       # GEMMA_DEVICE_MAP: "auto"
       # GEMMA_LOAD_4BIT: "1"
     volumes:
       - ${HOST_MODEL_DIR:-./gemma-4-E4B-it}:${GEMMA_MODEL_PATH:-/model}:ro
       - ${HOST_IMAGES_DIR:-./images}:${GEMMA_IMAGES_DIR:-/images}:ro
-    shm_size: "4gb"
+    shm_size: "8gb"
     gpus: all
