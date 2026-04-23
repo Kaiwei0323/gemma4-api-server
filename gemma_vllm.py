@@ -110,6 +110,7 @@ def load_vllm_backend() -> None:
     max_len = _int_env("GEMMA_VLLM_MAX_MODEL_LEN", 8192)
     gpu_mem = _float_env("GEMMA_VLLM_GPU_MEMORY_UTILIZATION", 0.90)
     trust = _truthy("GEMMA_VLLM_TRUST_REMOTE_CODE", True)
+    quant = os.environ.get("GEMMA_VLLM_QUANTIZATION", "").strip() or None
 
     # Multimodal defaults aligned with reference snippets
     limit_mm = {"image": _int_env("GEMMA_VLLM_LIMIT_MM_IMAGE", 4), "video": _int_env("GEMMA_VLLM_LIMIT_MM_VIDEO", 1)}
@@ -137,6 +138,8 @@ def load_vllm_backend() -> None:
         "hf_overrides": hf_overrides,
         "mm_processor_kwargs": mm_processor_kwargs,
     }
+    if quant:
+        engine_kw["quantization"] = quant
 
     try:
         engine_args = AsyncEngineArgs(**engine_kw)
@@ -145,6 +148,7 @@ def load_vllm_backend() -> None:
         # Older vLLM may not accept some kwargs — drop optional multimodal extras
         engine_kw.pop("hf_overrides", None)
         engine_kw.pop("mm_processor_kwargs", None)
+        engine_kw.pop("quantization", None)
         try:
             engine_args = AsyncEngineArgs(**engine_kw)
             _engine = AsyncLLM.from_engine_args(engine_args)
@@ -158,7 +162,14 @@ def load_vllm_backend() -> None:
         log.exception(_load_error)
         return
 
-    log.info("vLLM backend ready in %.1fs model=%s tp=%s max_len=%s", time.perf_counter() - t0, _model_path, tp, max_len)
+    log.info(
+        "vLLM backend ready in %.1fs model=%s tp=%s max_len=%s quantization=%s",
+        time.perf_counter() - t0,
+        _model_path,
+        tp,
+        max_len,
+        quant or "none",
+    )
 
 
 def shutdown_vllm() -> None:

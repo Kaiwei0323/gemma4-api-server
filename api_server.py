@@ -152,7 +152,6 @@ _processor = None
 _model_path: Path | None = None
 _load_error: str | None = None
 _model_kind: str | None = None  # "multimodal" | "causal" — set after successful load
-_model_supports_audio: bool | None = None  # True if config.audio_config is set (audio tower weights)
 _gen_lock = threading.Lock()
 _transformers_runtime_patches_applied = False
 
@@ -203,53 +202,14 @@ def _vllm_ready() -> bool:
 
 def _apply_transformers_runtime_patches() -> None:
     """
-    Transformers may prefer `torchcodec` for audio decoding when installed, but torchcodec can be
-    present yet unusable in minimal Docker images (missing FFmpeg shared libs / ABI mismatch).
+    Runtime patches for transformers.
 
-    Default: force librosa-based audio decoding unless GEMMA_USE_TORCHCODEC=1 and import works.
+    (Audio endpoints were removed; keep this as a no-op hook in case we add future
+    patches, but do not mutate transformers audio decoding behavior.)
     """
     global _transformers_runtime_patches_applied
     if _transformers_runtime_patches_applied:
         return
-
-    try:
-        import transformers.audio_utils as audio_utils  # type: ignore
-        import transformers.utils.import_utils as import_utils  # type: ignore
-    except Exception as e:
-        log.warning("Runtime patches: could not import transformers modules: %s", e)
-        _transformers_runtime_patches_applied = True
-        return
-
-    def _disable_torchcodec_audio() -> None:
-        def _no_torchcodec() -> bool:
-            return False
-
-        try:
-            audio_utils.is_torchcodec_available = _no_torchcodec  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            import_utils.is_torchcodec_available = _no_torchcodec  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    use_tc = _truthy_env("GEMMA_USE_TORCHCODEC", False)
-    if not use_tc:
-        _disable_torchcodec_audio()
-        log.info("Runtime patches: GEMMA_USE_TORCHCODEC disabled — using librosa audio decoding path")
-        _transformers_runtime_patches_applied = True
-        return
-
-    try:
-        import torchcodec  # noqa: F401
-    except Exception as e:
-        log.warning(
-            "Runtime patches: GEMMA_USE_TORCHCODEC=1 but torchcodec import failed (%s); "
-            "falling back to librosa audio decoding",
-            e,
-        )
-        _disable_torchcodec_audio()
-
     _transformers_runtime_patches_applied = True
 
 
@@ -742,9 +702,8 @@ def _validate_remote_media_url(url: str, *, kind: str) -> None:
 
 
 def _load_model() -> None:
-    global _model, _processor, _model_path, _load_error, _model_kind, _model_supports_audio
+    global _model, _processor, _model_path, _load_error, _model_kind
     _model_kind = None
-    _model_supports_audio = None
     t0 = time.perf_counter()
     raw = os.environ.get("GEMMA_MODEL_PATH", "").strip()
     path = Path(raw) if raw else _default_model_dir()
@@ -949,14 +908,9 @@ def _load_model() -> None:
     _model = model
     _model_path = path
     _load_error = None
-    _model_supports_audio = getattr(_model.config, "audio_config", None) is not None
-    log.info(
-        "Model load: audio_config %s",
-        "present" if _model_supports_audio else "absent (null)",
-    )
     _startup_echo(
         f"stage=model_load_complete total_s={time.perf_counter() - t0:.1f} model_kind={_model_kind!r} "
-        f"audio={_model_supports_audio!r} — HTTP API ready"
+        "— HTTP API ready"
     )
     log.info(
         "Model load: complete in %.1fs — ready for stream routes (%s)",
@@ -1578,7 +1532,6 @@ def health():
         "model_loaded": ok,
         "model_kind": _model_kind,
         "image_endpoint": ok and (_model_kind == "multimodal" or vllm_ok),
-        "audio_supported": bool(ok and _model_supports_audio),
         "images_dir": str(_default_images_dir()),
         "gpu": gpu_block,
         "error": _load_error,
