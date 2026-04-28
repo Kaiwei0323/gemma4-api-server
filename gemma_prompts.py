@@ -90,6 +90,55 @@ def _merge_consecutive_system_turns(
     return out
 
 
+def _merge_consecutive_same_role_turns(
+    messages: list[dict[str, Any]],
+    *,
+    multimodal: bool,
+) -> list[dict[str, Any]]:
+    """
+    Transformers' Gemma chat templates are strict about alternating user/assistant roles.
+    Merge any consecutive turns with the same role by concatenating their text.
+    """
+    if len(messages) < 2:
+        return messages
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        role = str(msg.get("role", "")).lower().strip()
+        if not out:
+            out.append(dict(msg))
+            continue
+        prev_role = str(out[-1].get("role", "")).lower().strip()
+        if role and role == prev_role:
+            a = _system_content_as_plain_text(out[-1]) if prev_role == "system" else _system_content_as_plain_text(out[-1])
+            b = _system_content_as_plain_text(msg)
+            merged = f"{a}\n\n{b}".strip() if a and b else (a or b)
+            if multimodal:
+                out[-1] = {"role": prev_role, "content": [{"type": "text", "text": merged}]}
+            else:
+                out[-1] = {"role": prev_role, "content": merged}
+        else:
+            out.append(dict(msg))
+    return out
+
+
+def _normalize_chat_roles(
+    messages: list[dict[str, Any]],
+    *,
+    multimodal: bool,
+) -> list[dict[str, Any]]:
+    """
+    Normalize message roles into a sequence that Gemma templates accept:
+    - Keep at most one leading `system` turn (merge if multiple).
+    - Merge any consecutive same-role turns (system/user/assistant).
+    This is defensive against clients that send `user,user,...` or `assistant,assistant,...`.
+    """
+    if not messages:
+        return []
+    out = _merge_consecutive_system_turns(list(messages), multimodal=multimodal)
+    out = _merge_consecutive_same_role_turns(out, multimodal=multimodal)
+    return out
+
+
 def default_system_prompt_would_prepend(messages: list[dict[str, Any]]) -> bool:
     """True if ``prepend_default_system`` will insert a system turn for this message list."""
     if not default_system_prompt_text():
@@ -121,4 +170,4 @@ def prepend_default_system(
     else:
         sys_turn = {"role": "system", "content": text}
     combined = [sys_turn, *list(messages)]
-    return _merge_consecutive_system_turns(combined, multimodal=multimodal)
+    return _normalize_chat_roles(combined, multimodal=multimodal)
