@@ -16,3 +16,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+medgemma-1.5-4b-it/
+gemma-4-E4B-it/
+__pycache__/

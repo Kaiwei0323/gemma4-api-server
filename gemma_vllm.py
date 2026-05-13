@@ -57,6 +57,57 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _vllm_device() -> str:
+    """
+    Choose a non-empty vLLM device string.
+
+    vLLM EngineArgs includes `device` (choices: auto/cuda/cpu/...). In some
+    environments vLLM's platform auto-detection can yield an empty device type,
+    which later crashes when `torch.device("")` is constructed. Force a sane
+    default here, while still allowing an override via env.
+    """
+    raw = os.environ.get("GEMMA_VLLM_DEVICE", "").strip().lower()
+    if raw:
+        return raw
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _force_vllm_platform_device_type(device: str) -> None:
+    """
+    Work around vLLM builds where platform auto-detection yields an empty device
+    type (which later crashes as torch.device("")).
+
+    Some vLLM versions do not expose `device` as an EngineArgs/AsyncEngineArgs
+    field, so we can't rely on passing `device=...` to AsyncEngineArgs. In those
+    cases we patch `current_platform.device_type` if it is empty.
+    """
+    try:
+        from vllm.platforms import current_platform  # type: ignore
+
+        cur = getattr(current_platform, "device_type", None)
+        if cur is None or str(cur).strip() == "":
+            setattr(current_platform, "device_type", device)
+    except Exception:
+        # Best-effort only; if this fails and vLLM doesn't accept device kwarg,
+        # vLLM may still fail and we'll surface that error.
+        return
+
+
+def _async_engine_args_accepts_device() -> bool:
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs  # type: ignore
+
+        fields = getattr(AsyncEngineArgs, "__dataclass_fields__", None)
+        return bool(fields and "device" in fields)
+    except Exception:
+        return False
+
+
 def is_loaded() -> bool:
     return _engine is not None and _load_error is None
 
@@ -111,6 +162,20 @@ def load_vllm_backend() -> None:
     gpu_mem = _float_env("GEMMA_VLLM_GPU_MEMORY_UTILIZATION", 0.90)
     trust = _truthy("GEMMA_VLLM_TRUST_REMOTE_CODE", True)
     quant = os.environ.get("GEMMA_VLLM_QUANTIZATION", "").strip() or None
+    device = _vllm_device()
+
+    if os.environ.get("GEMMA_REQUIRE_GPU", "1").strip().lower() not in ("0", "false", "no", "off"):
+        if device != "cuda":
+            _load_error = (
+                "vLLM: GEMMA_REQUIRE_GPU is enabled but vLLM device resolved to "
+                f"{device!r}. Ensure the container has GPU access (compose `gpus: all`) "
+                "or set GEMMA_VLLM_DEVICE=cuda."
+            )
+            log.error(_load_error)
+            return
+
+    # If vLLM can't be told `device=...`, ensure platform device_type isn't empty.
+    _force_vllm_platform_device_type(device)
 
     # Multimodal defaults aligned with reference snippets
     limit_mm = {"image": _int_env("GEMMA_VLLM_LIMIT_MM_IMAGE", 4), "video": _int_env("GEMMA_VLLM_LIMIT_MM_VIDEO", 1)}
@@ -138,6 +203,8 @@ def load_vllm_backend() -> None:
         "hf_overrides": hf_overrides,
         "mm_processor_kwargs": mm_processor_kwargs,
     }
+    if _async_engine_args_accepts_device():
+        engine_kw["device"] = device
     if quant:
         engine_kw["quantization"] = quant
 
@@ -221,6 +288,55 @@ def _parse_with_processor(raw: str) -> Any:
         return raw
 
 
+def _count_delta_tokens(completion: Any, fallback_text: str) -> int:
+    """
+    Best-effort delta token count for a vLLM completion in DELTA mode.
+
+    Prefers `len(token_ids)` when the engine exposes it; falls back to
+    counting 1 per non-empty text chunk so per-token latency stays meaningful
+    even on builds that do not surface delta token ids.
+    """
+    tids = getattr(completion, "token_ids", None)
+    try:
+        if tids is not None:
+            return len(tids)
+    except Exception:
+        pass
+    return 1 if fallback_text else 0
+
+
+def _build_latency_payload(
+    *,
+    t_request_start: float,
+    t_first_token: float | None,
+    t_end: float,
+    n_tokens: int,
+) -> dict[str, Any]:
+    """Common latency block emitted in the final SSE `done` event."""
+    elapsed = max(1e-9, t_end - t_request_start)
+    if t_first_token is not None:
+        ttft = round(t_first_token - t_request_start, 4)
+        decode_total = max(0.0, t_end - t_first_token)
+    else:
+        ttft = None
+        decode_total = 0.0
+    decode_per_token: float | None
+    if n_tokens > 1:
+        decode_per_token = round(decode_total / float(n_tokens - 1), 6)
+    else:
+        decode_per_token = None
+    tps = round(float(n_tokens) / elapsed, 3) if n_tokens > 0 else None
+    return {
+        "time_to_first_token_seconds": ttft,
+        "prompt_processing_latency_seconds": ttft,
+        "decode_latency_seconds": round(decode_total, 4),
+        "decode_latency_per_token_seconds": decode_per_token,
+        "end_to_end_latency_seconds": round(elapsed, 4),
+        "tokens_per_second": tps,
+        "output_tokens": n_tokens,
+    }
+
+
 async def sse_chat_stream(
     *,
     messages: list[dict[str, Any]],
@@ -276,16 +392,18 @@ async def sse_chat_stream(
     )
 
     raw_parts: list[str] = []
-    ttft: float | None = None
     n_chars = 0
-    t_gen0 = time.perf_counter()
+    n_tokens = 0
+    t_first_token: float | None = None
 
     try:
         async for output in _engine.generate(request_id=request_id, prompt=prompt, sampling_params=sp):
-            if ttft is None:
-                ttft = round(time.perf_counter() - t_gen0, 4)
             for completion in output.outputs:
                 chunk = completion.text or ""
+                delta_tokens = _count_delta_tokens(completion, chunk)
+                if delta_tokens > 0 and t_first_token is None:
+                    t_first_token = time.perf_counter()
+                n_tokens += delta_tokens
                 if chunk:
                     raw_parts.append(chunk)
                     n_chars += len(chunk)
@@ -298,15 +416,15 @@ async def sse_chat_stream(
 
     raw = "".join(raw_parts)
     parsed = _parse_with_processor(raw)
-    elapsed = max(1e-9, time.perf_counter() - t0)
+    t_end = time.perf_counter()
+    elapsed = max(1e-9, t_end - t0)
     cps = round(n_chars / elapsed, 3)
-    # Token count: approximate from async engine output if available
-    tps = None
-    try:
-        if raw_parts:
-            tps = round(len(raw_parts) / elapsed, 3)
-    except Exception:
-        pass
+    latency = _build_latency_payload(
+        t_request_start=t0,
+        t_first_token=t_first_token,
+        t_end=t_end,
+        n_tokens=n_tokens,
+    )
 
     yield (
         "event: done\ndata: "
@@ -315,9 +433,8 @@ async def sse_chat_stream(
                 "raw": raw if include_raw else None,
                 "parsed": parsed,
                 "model_path": _model_path,
-                "time_to_first_token_seconds": ttft,
-                "tokens_per_second": tps,
                 "chars_per_second": cps,
+                **latency,
             }
         )
         + "\n\n"
@@ -412,16 +529,18 @@ async def sse_image_stream(
     )
 
     raw_parts: list[str] = []
-    ttft: float | None = None
     n_chars = 0
-    t_gen0 = time.perf_counter()
+    n_tokens = 0
+    t_first_token: float | None = None
 
     try:
         async for output in _engine.generate(request_id=request_id, prompt=req_prompt, sampling_params=sp):
-            if ttft is None:
-                ttft = round(time.perf_counter() - t_gen0, 4)
             for completion in output.outputs:
                 chunk = completion.text or ""
+                delta_tokens = _count_delta_tokens(completion, chunk)
+                if delta_tokens > 0 and t_first_token is None:
+                    t_first_token = time.perf_counter()
+                n_tokens += delta_tokens
                 if chunk:
                     raw_parts.append(chunk)
                     n_chars += len(chunk)
@@ -434,9 +553,15 @@ async def sse_image_stream(
 
     raw = "".join(raw_parts)
     parsed = _parse_with_processor(raw)
-    elapsed = max(1e-9, time.perf_counter() - t0)
+    t_end = time.perf_counter()
+    elapsed = max(1e-9, t_end - t0)
     cps = round(n_chars / elapsed, 3)
-    tps = round(len(raw_parts) / elapsed, 3) if raw_parts else None
+    latency = _build_latency_payload(
+        t_request_start=t0,
+        t_first_token=t_first_token,
+        t_end=t_end,
+        n_tokens=n_tokens,
+    )
 
     yield (
         "event: done\ndata: "
@@ -445,9 +570,8 @@ async def sse_image_stream(
                 "raw": raw if include_raw else None,
                 "parsed": parsed,
                 "model_path": _model_path,
-                "time_to_first_token_seconds": ttft,
-                "tokens_per_second": tps,
                 "chars_per_second": cps,
+                **latency,
             }
         )
         + "\n\n"
@@ -520,16 +644,18 @@ async def sse_video_stream(
     )
 
     raw_parts: list[str] = []
-    ttft: float | None = None
     n_chars = 0
-    t_gen0 = time.perf_counter()
+    n_tokens = 0
+    t_first_token: float | None = None
 
     try:
         async for output in _engine.generate(request_id=request_id, prompt=req_prompt, sampling_params=sp):
-            if ttft is None:
-                ttft = round(time.perf_counter() - t_gen0, 4)
             for completion in output.outputs:
                 chunk = completion.text or ""
+                delta_tokens = _count_delta_tokens(completion, chunk)
+                if delta_tokens > 0 and t_first_token is None:
+                    t_first_token = time.perf_counter()
+                n_tokens += delta_tokens
                 if chunk:
                     raw_parts.append(chunk)
                     n_chars += len(chunk)
@@ -542,9 +668,15 @@ async def sse_video_stream(
 
     raw = "".join(raw_parts)
     parsed = _parse_with_processor(raw)
-    elapsed = max(1e-9, time.perf_counter() - t0)
+    t_end = time.perf_counter()
+    elapsed = max(1e-9, t_end - t0)
     cps = round(n_chars / elapsed, 3)
-    tps = round(len(raw_parts) / elapsed, 3) if raw_parts else None
+    latency = _build_latency_payload(
+        t_request_start=t0,
+        t_first_token=t_first_token,
+        t_end=t_end,
+        n_tokens=n_tokens,
+    )
 
     yield (
         "event: done\ndata: "
@@ -553,9 +685,8 @@ async def sse_video_stream(
                 "raw": raw if include_raw else None,
                 "parsed": parsed,
                 "model_path": _model_path,
-                "time_to_first_token_seconds": ttft,
-                "tokens_per_second": tps,
                 "chars_per_second": cps,
+                **latency,
             }
         )
         + "\n\n"

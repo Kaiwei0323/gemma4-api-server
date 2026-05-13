@@ -48,6 +48,7 @@ copy .env.example .env
   - **`GEMMA_VLLM_TP_SIZE`**: tensor parallel size (default `2` for two GPUs; use `1` on a single GPU).
   - **`GEMMA_VLLM_MAX_MODEL_LEN`**: context length cap (default `8192`).
   - **`GEMMA_VLLM_GPU_MEMORY_UTILIZATION`**: fraction of GPU memory for vLLM (default `0.90`).
+  - **`GEMMA_VLLM_DEVICE`**: force vLLM device (`cuda` or `cpu`). Default auto-resolves to `cuda` if available, else `cpu`.
 - **Performance tuning (HF path only, optional)**:
   - **`GEMMA_ENABLE_TF32`**: `1` (default) enables TF32 on CUDA for faster matmuls on modern GPUs (minor numeric differences vs full FP32).
   - **`GEMMA_ENABLE_SDPA`**: `1` (default) enables PyTorch scaled-dot-product attention fast paths when available.
@@ -105,4 +106,45 @@ curl -N -X POST "http://99.64.152.85:5000/video/stream" ^
   -F "text=Describe this video." ^
   -F "video_url=@videos/ForBiggerBlazes.mp4" ^
   -F "max_new_tokens=256"
+```
+
+## Streaming response shape & latency metrics
+
+All three streaming endpoints emit Server-Sent Events with the same event types:
+
+```text
+event: meta    # one-time, includes model_path / backend / default_system_prompt_applied
+event: token   # repeated, each delta: {"text": "..."}
+event: done    # one-time, final summary (see fields below)
+event: error   # only on failure: {"detail": "..."}
+```
+
+The final **`event: done`** payload includes per-request latency metrics (all in **seconds**), measured uniformly on both backends (`hf` and `vllm`):
+
+| Field | Meaning |
+|------|---------|
+| `time_to_first_token_seconds` | Wall time from request start to the **first** decoded output token (TTFT). |
+| `prompt_processing_latency_seconds` | Prefill phase — alias of TTFT (template + tokenize + device transfer + prefill + first decode). |
+| `decode_latency_seconds` | Total time spent producing tokens **after** the first one (decode phase only). |
+| `decode_latency_per_token_seconds` | Mean per-token decode latency: `decode_latency_seconds / max(1, output_tokens − 1)`. `null` when only one token was produced. |
+| `end_to_end_latency_seconds` | Full wall time from request start to last token. |
+| `tokens_per_second` | `output_tokens / end_to_end_latency_seconds`. |
+| `chars_per_second` | Decoded char throughput over end-to-end latency. |
+| `output_tokens` | Number of generated tokens. |
+
+Example final event:
+
+```json
+{
+  "parsed": "...",
+  "model_path": "/model",
+  "time_to_first_token_seconds": 0.412,
+  "prompt_processing_latency_seconds": 0.412,
+  "decode_latency_seconds": 1.873,
+  "decode_latency_per_token_seconds": 0.0149,
+  "end_to_end_latency_seconds": 2.285,
+  "tokens_per_second": 56.4,
+  "chars_per_second": 271.6,
+  "output_tokens": 128
+}
 ```

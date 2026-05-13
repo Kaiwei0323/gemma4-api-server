@@ -1291,9 +1291,25 @@ def _generate_stream_sse_from_inputs(
     gen_kwargs: dict[str, Any],
     include_raw: bool,
     meta_extra: dict[str, Any] | None = None,
+    t_request_start: float | None = None,
 ):
     """
     Shared SSE streamer for any already-prepared `inputs` compatible with `_model.generate(**inputs, ...)`.
+
+    Latency metrics emitted in the final `done` event (all in seconds):
+      - time_to_first_token_seconds: request_start -> first output token (prefill window)
+      - prompt_processing_latency_seconds: alias of TTFT (prefill phase)
+      - decode_latency_seconds: total time spent decoding tokens after the first token
+      - decode_latency_per_token_seconds: mean per-token decode latency
+                                          (decode_latency / max(1, n_tokens - 1))
+      - end_to_end_latency_seconds: full wall-clock time of the request
+      - tokens_per_second: total output tokens / end-to-end latency
+      - chars_per_second: total output chars / end-to-end latency
+
+    `t_request_start` should be the perf_counter() captured at the very start of the
+    HTTP handler so that prep work (template rendering, tokenization, host->device
+    copies) is included in TTFT and end-to-end latency. If omitted, latency is
+    measured from entry into this function (legacy behavior).
     """
     assert _model is not None and _processor is not None
 
@@ -1332,7 +1348,8 @@ def _generate_stream_sse_from_inputs(
     merged = dict(gen_kwargs)
     merged["streamer"] = streamer
 
-    t0 = time.perf_counter()
+    t_enter = time.perf_counter()
+    t0 = t_request_start if t_request_start is not None else t_enter
     t_started: float | None = None
 
     def _run_generate() -> None:
@@ -1347,7 +1364,7 @@ def _generate_stream_sse_from_inputs(
     th.start()
     _perf(
         "stream_generate_thread_started delay_ms=%.2f max_new_tokens=%s do_sample=%s",
-        (time.perf_counter() - t0) * 1000.0,
+        (time.perf_counter() - t_enter) * 1000.0,
         merged.get("max_new_tokens"),
         merged.get("do_sample"),
     )
@@ -1359,16 +1376,18 @@ def _generate_stream_sse_from_inputs(
 
     raw_parts: list[str] = []
     ttft: float | None = None
+    t_first_token: float | None = None
     n_chars = 0
 
     try:
         for chunk in streamer:
             if ttft is None:
-                ttft = round(time.perf_counter() - t0, 4)
+                t_first_token = time.perf_counter()
+                ttft = round(t_first_token - t0, 4)
                 _perf(
                     "stream_first_chunk ttft_s=%s thread_start_delay_ms=%.2f",
                     ttft,
-                    ((t_started - t0) * 1000.0) if t_started is not None else -1.0,
+                    ((t_started - t_enter) * 1000.0) if t_started is not None else -1.0,
                 )
             if not chunk:
                 continue
@@ -1384,9 +1403,21 @@ def _generate_stream_sse_from_inputs(
     raw = "".join(raw_parts)
     parsed = _processor.parse_response(raw)
 
-    elapsed = max(1e-9, time.perf_counter() - t0)
+    t_end = time.perf_counter()
+    elapsed = max(1e-9, t_end - t0)
+    n_tokens = int(getattr(streamer, "new_token_count", 0))
     cps = round(n_chars / elapsed, 3)
-    tps = round(float(getattr(streamer, "new_token_count", 0)) / elapsed, 3)
+    tps = round(float(n_tokens) / elapsed, 3)
+
+    if t_first_token is not None:
+        decode_total = max(0.0, t_end - t_first_token)
+    else:
+        decode_total = 0.0
+    decode_per_token: float | None
+    if n_tokens > 1:
+        decode_per_token = round(decode_total / float(n_tokens - 1), 6)
+    else:
+        decode_per_token = None
 
     yield (
         "event: done\ndata: "
@@ -1396,8 +1427,13 @@ def _generate_stream_sse_from_inputs(
                 "parsed": parsed,
                 "model_path": str(_model_path) if _model_path else None,
                 "time_to_first_token_seconds": ttft,
+                "prompt_processing_latency_seconds": ttft,
+                "decode_latency_seconds": round(decode_total, 4),
+                "decode_latency_per_token_seconds": decode_per_token,
+                "end_to_end_latency_seconds": round(elapsed, 4),
                 "tokens_per_second": tps,
                 "chars_per_second": cps,
+                "output_tokens": n_tokens,
             }
         )
         + "\n\n"
@@ -1409,9 +1445,20 @@ def _chat_stream_sse_events(req: ChatRequest):
     Yield Server-Sent Events (SSE) for chat completion.
 
     Event payloads are JSON strings:
-      - event: meta   data: {"model_path": "..."}
+      - event: meta   data: {"model_path": "...", "backend": "...", ...}
       - event: token  data: {"text": "..."}
-      - event: done   data: {"raw": "...", "parsed": ..., "time_to_first_token_seconds": ..., "tokens_per_second": ...}
+      - event: done   data: {
+            "raw": "...",
+            "parsed": ...,
+            "time_to_first_token_seconds": ...,        # TTFT (request_start -> first token)
+            "prompt_processing_latency_seconds": ...,  # alias of TTFT (prefill phase)
+            "decode_latency_seconds": ...,             # total decode-phase duration
+            "decode_latency_per_token_seconds": ...,   # mean per-token decode latency
+            "end_to_end_latency_seconds": ...,         # full request wall time
+            "tokens_per_second": ...,
+            "chars_per_second": ...,
+            "output_tokens": ...
+        }
       - event: error  data: {"detail": "..."}
     """
     assert _model is not None and _processor is not None
@@ -1455,6 +1502,7 @@ def _chat_stream_sse_events(req: ChatRequest):
         gen_kwargs=gen_kwargs,
         include_raw=req.include_raw,
         meta_extra={"default_system_prompt_applied": default_system_applied},
+        t_request_start=t0,
     )
 
 
@@ -1733,6 +1781,7 @@ async def image_chat_stream(
                 gen_kwargs=gen_kwargs,
                 include_raw=req.include_raw,
                 meta_extra={"default_system_prompt_applied": default_system_applied},
+                t_request_start=t0,
             ),
             media_type="text/event-stream",
             headers={
@@ -1896,6 +1945,7 @@ async def video_chat_stream(
                 gen_kwargs=gen_kwargs,
                 include_raw=req.include_raw,
                 meta_extra={"default_system_prompt_applied": default_system_applied},
+                t_request_start=t0,
             ),
             media_type="text/event-stream",
             headers={
